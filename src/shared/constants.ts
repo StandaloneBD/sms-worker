@@ -117,6 +117,10 @@ export const TEMPLATE_TOKEN_REGEX = /%([A-Z0-9_]+)%/g;
 /** KV cache keys + TTLs (seconds). D1 is source of truth; ADR 0002 makes the
  *  cache a send-path availability shield, hence the generous TTLs. */
 export const KV_TTL_SECONDS = 300;
+/** Auth-cache entry lifetime. Bounds how long a stale verdict (e.g. one
+ *  rewritten by a sync racing a key rotation) can survive for D1-outage
+ *  fallback; longer than KV_TTL_SECONDS to keep refresh writes rare. */
+export const AUTH_CACHE_TTL_SECONDS = 900;
 export const kvAppByKeyHash = (keyHash: string) => `app:key:${keyHash}`;
 export const KV_APP_CONFIG_PREFIX = "app:config:";
 export const kvAppConfig = (appId: number) => `${KV_APP_CONFIG_PREFIX}${appId}`;

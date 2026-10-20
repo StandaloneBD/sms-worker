@@ -10,7 +10,7 @@
 import { createMiddleware } from "hono/factory";
 import { getAppByKeyHash, getDb } from "../db";
 import { sha256Hex } from "../shared/crypto";
-import { kvAppByKeyHash } from "../shared/constants";
+import { AUTH_CACHE_TTL_SECONDS, kvAppByKeyHash } from "../shared/constants";
 import { writeAppAuthCache } from "../core/auth-cache";
 import type { AppEnv, AuthedApp } from "../shared/types";
 
@@ -21,11 +21,14 @@ function parseBearerToken(header: string | undefined): string | null {
   return token && token.length > 0 ? token : null;
 }
 
-/** Key hash → the verdict this isolate last confirmed is in KV. Lets the
- *  request path skip KV entirely once the outage shield is known to be
- *  current; bounded so a flood of distinct keys can't grow it unchecked. */
-const confirmedInCache = new Map<string, string>();
+/** Key hash → the verdict this isolate last confirmed is in KV, and until
+ *  when to trust that. Lets the request path skip KV while the outage shield
+ *  is known to be current; re-checked at half the entry's TTL so it is
+ *  refreshed before it expires. Bounded so a flood of distinct keys can't
+ *  grow it unchecked. */
+const confirmedInCache = new Map<string, { serialized: string; until: number }>();
 const CONFIRMED_CACHE_MAX = 1000;
+const CONFIRM_FOR_MS = (AUTH_CACHE_TTL_SECONDS * 1000) / 2;
 
 function isAuthedApp(value: unknown): value is AuthedApp {
   const v = value as AuthedApp | null;
@@ -55,17 +58,21 @@ async function readAuthCache(env: Env, hash: string): Promise<AuthedApp | null> 
 }
 
 /** Brings the KV shield in line with D1, off the request path. Reads KV at
- *  most once per key per isolate, and writes only when the entry is missing
- *  or differs — KV writes must stay rare (Workers Free: 1,000/day). */
+ *  most once per key per isolate per CONFIRM_FOR_MS, and writes only when the
+ *  entry is missing or differs — KV writes must stay rare (Workers Free:
+ *  1,000/day). Entries expire, so a write that races a key rotation can
+ *  outlive it by at most AUTH_CACHE_TTL_SECONDS. */
 async function syncAuthCache(env: Env, hash: string, authed: AuthedApp): Promise<void> {
   const serialized = JSON.stringify(authed);
-  if (confirmedInCache.get(hash) === serialized) return;
+  const now = Date.now();
+  const confirmed = confirmedInCache.get(hash);
+  if (confirmed && confirmed.serialized === serialized && confirmed.until > now) return;
   const cached = await readAuthCache(env, hash);
   if (!cached || JSON.stringify(cached) !== serialized) {
     await writeAppAuthCache(env, hash, authed);
   }
   if (confirmedInCache.size >= CONFIRMED_CACHE_MAX) confirmedInCache.clear();
-  confirmedInCache.set(hash, serialized);
+  confirmedInCache.set(hash, { serialized, until: now + CONFIRM_FOR_MS });
 }
 
 export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
