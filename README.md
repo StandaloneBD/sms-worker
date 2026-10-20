@@ -3,8 +3,10 @@
 Standalone SMS gateway on Cloudflare Workers. Any backend ("App") registers
 once, gets an API key, and sends SMS through a provider-failover pipeline
 (BulkSMSBD → MiMSMS by default) with per-recipient history in D1, bulk jobs
-via Queues + R2, `%TOKEN%` templating, per-app provider priorities, and
-per-app masking profiles (custom sender identity / credentials).
+via Queues + R2 with retries for provider outages, `%TOKEN%` templating,
+per-app provider priorities, per-app masking profiles (custom sender
+identity / credentials), idempotency keys, and per-app rate limits and
+daily quotas.
 
 Domain language: [CONTEXT.md](./CONTEXT.md). Key decisions:
 [docs/adr/](./docs/adr/).
@@ -14,11 +16,18 @@ Domain language: [CONTEXT.md](./CONTEXT.md). Key decisions:
 - **Hono** API (`/v1/*`, bearer `sk_...` keys) + server-rendered **admin UI**
   (`/admin`, session cookie).
 - **D1** (drizzle-orm) — apps, providers, masking profiles, templates, jobs,
-  chunks, per-recipient message history (90-day retention via nightly cron).
-- **Queues** — a bulk job is split into 250-recipient chunks; each queue
-  message is only `{jobId, chunkIndex}`; the payload lives in **R2**
-  (ADR 0001). Failed chunks retry with exponential backoff, then dead-letter
-  to `sms-dlq` where they're recorded as failed.
+  chunks, per-recipient message history (90-day retention), idempotency
+  keys, daily usage counters.
+- **Queues + R2** — a bulk job is split into 250-recipient chunks, written
+  to R2 as one NDJSON line per chunk; each queue message is
+  `{jobId, chunkIndex, round}` and the consumer reads only its chunk's line
+  (ranged GET). Recipients that fail for a transport or provider-side reason
+  are retried in later send rounds (60 s, 120 s, 240 s); each round's results
+  are checkpointed to R2 so a redelivery never sends them twice (ADR 0005).
+  Infrastructure errors retry with backoff, then dead-letter to `sms-dlq`.
+- **Cron (every 15 min)** — re-enqueues stalled chunks (and fails them after
+  3 tries) so every job finishes, then purges a bounded slice of expired
+  history, jobs, idempotency keys and usage rows.
 - **KV** — cache for app auth + provider config, so sends survive a D1
   outage (ADR 0002: sending outranks record-keeping).
 
@@ -32,13 +41,16 @@ npx wrangler d1 create sms-worker           # put database_id into wrangler.json
 npx wrangler kv namespace create CACHE      # put id into wrangler.jsonc
 npx wrangler r2 bucket create sms-worker-payloads
 npx wrangler queues create sms-jobs
-npx wrangler queues create sms-dlq
+npx wrangler queues create sms-dlq          # keep the "-dlq" suffix if renamed
+# Backstop for job objects whose cleanup failed (normally deleted on completion)
+npx wrangler r2 bucket lifecycle add sms-worker-payloads expire-jobs jobs/ --expire-days 7
 
 # 2. Migrations
 npm run db:migrate:local     # local dev
 npm run db:migrate:remote    # production D1
 
-# 3. Secrets (production)
+# 3. Secrets (production) — the worker refuses to run with these missing or
+#    shorter than 16 characters
 npx wrangler secret put ENCRYPTION_KEY           # any long random string
 npx wrangler secret put SESSION_SECRET           # any long random string
 npx wrangler secret put ADMIN_BOOTSTRAP_PASSWORD
@@ -58,9 +70,22 @@ Provider credentials are not worker secrets — after first login, open
 Admin → Providers and enter each provider's API key and sender identity
 (sender id for BulkSMSBD; username + sender name for MiMSMS). They're stored
 AES-GCM-encrypted in D1 (`ENCRYPTION_KEY`) and changes apply immediately.
+Disabling a provider there is a kill switch: no app dispatches through it,
+whatever its own provider plan says.
 Local dev runs with `FAKE_SMS=true`, so no credentials are needed; to hit
 real providers locally, set `FAKE_SMS=false` in `.dev.vars` and enter
 credentials in the UI.
+
+### 6. Configuration (`wrangler.jsonc`)
+
+- `CORS_ORIGINS` — browser origins allowed to call `/v1` (comma-separated),
+  `*` for any, empty for none. The API is server-to-server; any key used from
+  a browser is readable by that page's visitors, so list only origins that
+  truly need it.
+- `ratelimits` — `SEND_LIMITER` (per app, send/job requests per minute) and
+  `LOGIN_LIMITER` (per IP, admin sign-in attempts per minute).
+- Queue consumer `max_concurrency` caps parallel chunk sends (provider rate
+  limits, D1 write contention).
 
 ## API
 
@@ -70,21 +95,42 @@ credentials in the UI.
 # Sync send (OTPs etc., ≤100 recipients, immediate result)
 curl -X POST https://sms.shihabmridha.com/v1/sms/send \
   -H "Authorization: Bearer sk_..." -H "Content-Type: application/json" \
+  -H "Idempotency-Key: otp-7f3a91" \
   -d '{"message": "Your code is 1234", "recipients": ["01712345678"]}'
 
 # Bulk job (≤50,000 recipients, queued) — returns 202 {jobId}
 curl -X POST https://sms.shihabmridha.com/v1/sms/jobs \
   -H "Authorization: Bearer sk_..." -H "Content-Type: application/json" \
+  -H "Idempotency-Key: fee-reminder-2026-10" \
   -d '{"templateId": 1, "recipients": [{"to": "01712345678", "vars": {"NAME": "Rahim"}}]}'
 
 curl https://sms.shihabmridha.com/v1/sms/jobs/<jobId>          # progress
 curl https://sms.shihabmridha.com/v1/sms/jobs/<jobId>/messages # per-recipient
 ```
 
+Each recipient's body is its own `message` if given, else the rendered
+template, else the request-level `message`.
+
+Sync results are `{to, accepted, provider, reason, trackingId, retryable}`
+per recipient. `retryable: true` means some provider failed it for a
+transport or provider-side reason (not a rejected number), so retrying
+later may succeed.
+
 Also: `/v1/templates` CRUD (`%NAME%` placeholders; missing vars render
-empty), `GET|PUT /v1/providers` (per-app enable/priority),
-`GET /v1/masking-profiles`. Add `"maskingProfile": "<label>"` to a send/job
-to dispatch with that profile's sender identity/credentials.
+empty), `GET|PUT /v1/providers` (per-app enable/priority, within the
+globally enabled providers), `GET /v1/masking-profiles`. Add
+`"maskingProfile": "<label>"` to a send/job to dispatch with that profile's
+sender identity/credentials — an unknown label is a 400. Providers without
+that profile fall back to the global sender identity unless
+`"maskingStrict": true`, which leaves them out of the chain.
+
+### Idempotency
+
+Send `Idempotency-Key: <1-255 chars>` on `/sms/send` and `/sms/jobs` to make
+retries safe. A repeat with the same key and body within 24 h returns the
+original response (header `Idempotent-Replayed: true`) instead of sending
+again; 409 while the first request is still running; 422 if the key was used
+for a different body. Failed (non-2xx) requests don't keep the key.
 
 ### Request limits
 
@@ -97,18 +143,23 @@ to dispatch with that profile's sender identity/credentials.
   characters.
 - An oversized body is rejected before it's read, as `413 {"error": "request
   body too large"}`.
+- Send/job requests per app are rate limited (`429`), and an app with a
+  daily quota (Admin → Apps) gets `429` once its recipients for the UTC day
+  would exceed it.
 
 ## Notes
 
-- Delivery is **at-least-once** end to end (queue redelivery + provider
-  failover); duplicates are preferred over silent loss. See CONTEXT.md
-  "Dispatch".
+- Delivery is **at-least-once** end to end (provider failover, send rounds,
+  queue redelivery); duplicates are preferred over silent loss, and are
+  confined to a crash during a send itself. See CONTEXT.md "Dispatch" and
+  ADR 0005.
 - Phone numbers: `^\+?[0-9]{11,14}$`, stored as given; MiMSMS 880-prefixing
   happens inside its adapter only.
 - Sizing constants (chunk 250, sync cap 100, job cap 50k) are tuned for
   **Workers Free** limits — see `src/shared/constants.ts` before raising.
-- API key rotation and app activate/deactivate take effect immediately (D1 is
-  authoritative for auth — see ADR 0003). Global provider credential saves
-  (ADR 0004) and per-app provider/masking changes made through the UI/API
-  invalidate app caches (KV) instantly; anything else refreshes within
-  5 minutes.
+- API key rotation, app activate/deactivate and quota changes take effect
+  immediately (D1 is authoritative for auth — see ADR 0003). Global provider
+  credential saves (ADR 0004) and per-app provider/masking changes made
+  through the UI/API invalidate app caches (KV) instantly; anything else
+  refreshes within 5 minutes.
+- Changing an admin password signs out that admin's other sessions.

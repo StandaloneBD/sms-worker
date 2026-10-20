@@ -115,11 +115,19 @@ export interface BuiltPlan {
   warnings: string[];
 }
 
+/** Whether the App has a masking profile with this label (for any provider).
+ *  Reads the same cached config dispatch uses. */
+export async function maskingProfileExists(env: Env, db: Db, appId: number, label: string): Promise<boolean> {
+  const config = await loadAppConfig(env, db, appId);
+  return config.profiles.some((profile) => profile.label === label);
+}
+
 export async function buildDispatchPlan(
   env: Env,
   db: Db,
   appId: number,
   maskingLabel?: string,
+  opts: { maskingStrict?: boolean } = {},
 ): Promise<BuiltPlan> {
   if (env.FAKE_SMS === "true") {
     return { entries: [{ provider: new FakeSms() }], warnings: [] };
@@ -135,21 +143,27 @@ export async function buildDispatchPlan(
       ? config.profiles.find((p) => p.provider === item.provider && p.label === maskingLabel)
       : undefined;
     if (profile) maskingMatched = true;
+    // Strict masking: a provider without the profile would send under the
+    // global sender identity instead, so it is left out of the chain.
+    if (maskingLabel && opts.maskingStrict && !profile) {
+      warnings.push(`${item.provider} omitted: no "${maskingLabel}" masking profile (maskingStrict)`);
+      continue;
+    }
     const global = config.globals[item.provider];
 
     // Credentials resolve masking profile → global provider settings, both
     // D1-backed; there is no worker-secret fallback. A provider without
-    // credentials is omitted from the chain rather than failing the whole
-    // dispatch — the warning is additive, callers treat warnings as
-    // non-fatal.
-    const apiKeyEnc = profile?.apiKeyEnc ?? global?.apiKeyEnc;
-    const apiKey = apiKeyEnc ? await decryptSecret(env, apiKeyEnc) : undefined;
-    if (!apiKey) {
-      warnings.push(`${item.provider} omitted: no API key configured (Admin → Providers)`);
-      continue;
-    }
-
+    // usable credentials (missing, or failing to decrypt) is omitted from
+    // the chain rather than failing the whole dispatch — the warning is
+    // additive, callers treat warnings as non-fatal.
     try {
+      const apiKeyEnc = profile?.apiKeyEnc ?? global?.apiKeyEnc;
+      const apiKey = apiKeyEnc ? await decryptSecret(env, apiKeyEnc) : undefined;
+      if (!apiKey) {
+        warnings.push(`${item.provider} omitted: no API key configured (Admin → Providers)`);
+        continue;
+      }
+
       if (item.provider === "bulksmsbd") {
         const senderId = profile?.senderId ?? global?.senderId;
         if (!senderId) {
@@ -171,7 +185,7 @@ export async function buildDispatchPlan(
     }
   }
 
-  if (maskingLabel && !maskingMatched) {
+  if (maskingLabel && !maskingMatched && !opts.maskingStrict) {
     warnings.push(`masking profile "${maskingLabel}" matched no provider; using global credentials`);
   }
   return { entries, warnings };

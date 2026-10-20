@@ -21,6 +21,7 @@ import {
   appMaskingCreatePost,
   appMaskingDeletePost,
   appProvidersPost,
+  appQuotaPost,
   appRotateKeyPost,
   appsCreatePost,
   appsListGet,
@@ -63,6 +64,7 @@ adminRoutes.get("/apps/:id", appDetailGet);
 adminRoutes.post("/apps/:id/active", appActivePost);
 adminRoutes.post("/apps/:id/rotate-key", appRotateKeyPost);
 adminRoutes.post("/apps/:id/providers", appProvidersPost);
+adminRoutes.post("/apps/:id/quota", appQuotaPost);
 adminRoutes.post("/apps/:id/masking-profiles", appMaskingCreatePost);
 adminRoutes.post("/apps/:id/masking-profiles/:profileId/delete", appMaskingDeletePost);
 adminRoutes.post("/apps/:id/templates", appTemplateCreatePost);

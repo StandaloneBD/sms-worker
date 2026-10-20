@@ -4,7 +4,7 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
-import { ProviderTransportError } from "./errors";
+import { ProviderTransportError, failureForStatus, failureOf } from "./errors";
 
 const ONE_TO_MANY_URL = "https://api.mimsms.com/api/V2/OneToMany";
 const DYNAMIC_SMS_URL = "https://api.mimsms.com/api/V2/DSMS";
@@ -226,7 +226,8 @@ export class MimSms implements ISmsProvider {
             reason,
           }),
         );
-        outcomes.push(...numbers.map((): SmsSendOutcome => ({ accepted: false, reason })));
+        const failure = failureOf(err);
+        outcomes.push(...numbers.map((): SmsSendOutcome => ({ accepted: false, reason, failure })));
       }
     }
 
@@ -272,7 +273,7 @@ export class MimSms implements ISmsProvider {
           bodyKeys: Object.keys(body),
         }),
       );
-      return numbers.map(() => ({ accepted: false, reason }));
+      return numbers.map((): SmsSendOutcome => ({ accepted: false, reason, failure: "provider" }));
     }
 
     // A number may legitimately appear twice — two recipients can share a
@@ -326,7 +327,7 @@ export class MimSms implements ISmsProvider {
 
       const failureReason = errorReasons.get(key);
       if (failureReason !== undefined) {
-        return { accepted: false, reason: failureReason };
+        return { accepted: false, reason: failureReason, failure: "recipient" };
       }
 
       if (trackingIds.has(key)) {
@@ -344,7 +345,9 @@ export class MimSms implements ISmsProvider {
         // certainly sent.
         return { accepted: true };
       }
-      return { accepted: false, reason: "provider did not acknowledge recipient" };
+      // Ambiguous rather than a rejection: retrying may duplicate, but
+      // at-least-once prefers that over dropping it.
+      return { accepted: false, reason: "provider did not acknowledge recipient", failure: "provider" };
     });
 
     if (unreported > 0) {
@@ -389,7 +392,9 @@ export class MimSms implements ISmsProvider {
     }
 
     if (!response.ok) {
-      throw new ProviderTransportError(`MimSms request failed with status ${response.status}`);
+      throw new ProviderTransportError(`MimSms request failed with status ${response.status}`, {
+        failure: failureForStatus(response.status),
+      });
     }
 
     try {

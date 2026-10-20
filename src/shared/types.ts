@@ -6,12 +6,27 @@
 export const PROVIDER_NAMES = ["bulksmsbd", "mimsms"] as const;
 export type ProviderName = (typeof PROVIDER_NAMES)[number];
 
+/**
+ * Why one provider attempt did not accept a recipient (CONTEXT.md "Failure
+ * kind"):
+ *  - "transport": no definitive answer — network error, timeout, 5xx/408/429,
+ *    unparseable body. The SMS may or may not have gone out.
+ *  - "provider": the provider answered but refused for a reason on its side
+ *    (credentials, balance, sender config, a batch rejection it doesn't
+ *    attribute to a recipient). Not sent.
+ *  - "recipient": the provider rejected this recipient specifically (e.g. an
+ *    invalid number). Not sent, and retrying through it won't help.
+ */
+export type FailureKind = "transport" | "provider" | "recipient";
+
 /** Per-recipient outcome of one provider attempt (ported from acadion). */
 export interface SmsSendOutcome {
   accepted: boolean;
   reason?: string;
   /** Provider's own id for the accepted message, when it reports one. */
   trackingId?: string;
+  /** Set on every declined outcome an adapter produces. */
+  failure?: FailureKind;
 }
 
 export interface SmsDynamicMessage {
@@ -51,6 +66,10 @@ export interface DispatchResultItem extends SmsSendOutcome {
   to: string;
   /** Which provider finally accepted (or null when every provider declined). */
   provider: ProviderName | "fake" | null;
+  /** A later attempt could still succeed: some provider failed this
+   *  recipient for a transport or provider-side reason rather than rejecting
+   *  the recipient itself. Always false when accepted. */
+  retryable: boolean;
 }
 
 /** Input to the failover dispatch loop: uniform or per-recipient bodies. */
@@ -58,10 +77,13 @@ export type DispatchInput =
   | { kind: "uniform"; message: string; recipients: string[] }
   | { kind: "dynamic"; messages: SmsDynamicMessage[] };
 
-/** Queue message — payload itself lives in R2 (ADR 0001). */
+/** Queue message — payload itself lives in R2 (ADR 0001). `round` names the
+ *  send round it acts on; messages enqueued before send rounds existed
+ *  carry none, which means round 0. */
 export interface ChunkQueueMessage {
   jobId: string;
   chunkIndex: number;
+  round?: number;
 }
 
 /** One recipient inside a job payload / send request. */
@@ -73,17 +95,32 @@ export interface JobRecipient {
   vars?: Record<string, string>;
 }
 
-/** The JSON document parked at jobs/{jobId}.json in R2. */
-export interface JobPayload {
+/** Job-level fields every chunk of a Job's payload carries. */
+export interface JobPayloadHeader {
   jobId: string;
   appId: number;
-  /** Uniform body; absent when templateId or per-recipient messages are used. */
+  /** Request-level body, used for any recipient without its own message
+   *  when no template is referenced. */
   message?: string;
   templateId?: number;
   /** Pre-fetched template body so the consumer never depends on D1 for it. */
   templateBody?: string;
   /** Masking profile label; resolved per provider at dispatch time. */
   maskingProfile?: string;
+  /** Only dispatch through providers that have the masking profile. */
+  maskingStrict?: boolean;
+}
+
+/** One line of jobs/{jobId}/payload.ndjson in R2 — a self-contained chunk,
+ *  read with a ranged GET (ADR 0005). */
+export interface ChunkPayload extends JobPayloadHeader {
+  chunkIndex: number;
+  recipients: JobRecipient[];
+}
+
+/** The single JSON document jobs/{jobId}.json that Jobs created before
+ *  NDJSON payloads used; read only for their chunks. */
+export interface LegacyJobPayload extends JobPayloadHeader {
   chunkSize: number;
   recipients: JobRecipient[];
 }
@@ -101,6 +138,9 @@ export interface AuthedApp {
   id: number;
   name: string;
   isActive: boolean;
+  /** Max recipients per UTC day; null/absent = unlimited. Absent on cache
+   *  entries written before quotas existed. */
+  dailyQuota?: number | null;
 }
 
 /** Hono context bindings shared by all routes. */

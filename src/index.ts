@@ -9,16 +9,31 @@ import type { AppEnv } from "./shared/types";
 // strict: false — /admin and /admin/ are the same page.
 export const app = new Hono<AppEnv>({ strict: false });
 
-app.use(
-  "*",
-  cors({
-    origin: "*",
-    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
-    allowHeaders: ["*"],
-    exposeHeaders: ["*"],
-    maxAge: 86400,
-  }),
-);
+/**
+ * The CORS origin to allow for a request, from the CORS_ORIGINS var: a
+ * comma-separated allowlist, "*" for any origin, empty for none (no CORS
+ * headers, so browsers block cross-origin calls).
+ */
+export function corsOriginFor(requestOrigin: string, configured: string | undefined): string | null {
+  const allowed = (configured ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  if (allowed.includes("*")) return "*";
+  return allowed.includes(requestOrigin) ? requestOrigin : null;
+}
+
+// API + health only: the admin UI is same-origin, cookie-authenticated
+// forms and has no business answering cross-origin requests.
+const apiCors = cors({
+  origin: (origin, c) => corsOriginFor(origin, (c.env as Env | undefined)?.CORS_ORIGINS),
+  allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
+  allowHeaders: ["*"],
+  exposeHeaders: ["*"],
+  maxAge: 86400,
+});
+app.use("/v1/*", apiCors);
+app.use("/health", apiCors);
 
 app.get("/", (c) => c.redirect("/admin"));
 app.get("/health", (c) => c.json({ ok: true }));

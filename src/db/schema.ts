@@ -18,6 +18,9 @@ export const admins = sqliteTable("admins", {
   id: int("id").primaryKey({ autoIncrement: true }),
   username: text("username").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
+  /** Bumped on password change; session cookies signed with an older version
+   *  stop verifying, so a password change logs out every other session. */
+  sessionVersion: int("session_version").notNull().default(0),
   createdAt: int("created_at").notNull(),
   updatedAt: int("updated_at").notNull(),
 });
@@ -29,6 +32,8 @@ export const apps = sqliteTable("apps", {
   keyHash: text("key_hash").notNull().unique(),
   keyPrefix: text("key_prefix").notNull(),
   isActive: int("is_active", { mode: "boolean" }).notNull().default(true),
+  /** Max recipients per UTC day across sends and jobs; null = unlimited. */
+  dailyQuota: int("daily_quota"),
   createdAt: int("created_at").notNull(),
 });
 
@@ -88,24 +93,32 @@ export const templates = sqliteTable(
   (t) => [uniqueIndex("templates_app_name_unique").on(t.appId, t.name)],
 );
 
-export const jobs = sqliteTable("jobs", {
-  /** uuid */
-  id: text("id").primaryKey(),
-  appId: int("app_id").notNull(),
-  kind: text("kind", { enum: JOB_KINDS }).notNull(),
-  status: text("status", { enum: JOB_STATUSES }).notNull(),
-  body: text("body"),
-  templateId: int("template_id"),
-  maskingProfile: text("masking_profile"),
-  total: int("total").notNull().default(0),
-  sent: int("sent").notNull().default(0),
-  failed: int("failed").notNull().default(0),
-  chunkCount: int("chunk_count").notNull().default(0),
-  chunksDone: int("chunks_done").notNull().default(0),
-  error: text("error"),
-  createdAt: int("created_at").notNull(),
-  completedAt: int("completed_at"),
-});
+export const jobs = sqliteTable(
+  "jobs",
+  {
+    /** uuid */
+    id: text("id").primaryKey(),
+    appId: int("app_id").notNull(),
+    kind: text("kind", { enum: JOB_KINDS }).notNull(),
+    status: text("status", { enum: JOB_STATUSES }).notNull(),
+    body: text("body"),
+    templateId: int("template_id"),
+    maskingProfile: text("masking_profile"),
+    total: int("total").notNull().default(0),
+    sent: int("sent").notNull().default(0),
+    failed: int("failed").notNull().default(0),
+    chunkCount: int("chunk_count").notNull().default(0),
+    chunksDone: int("chunks_done").notNull().default(0),
+    error: text("error"),
+    createdAt: int("created_at").notNull(),
+    completedAt: int("completed_at"),
+  },
+  (t) => [
+    index("jobs_app_created_idx").on(t.appId, t.createdAt),
+    index("jobs_created_idx").on(t.createdAt),
+    index("jobs_status_idx").on(t.status),
+  ],
+);
 
 export const jobChunks = sqliteTable(
   "job_chunks",
@@ -116,8 +129,31 @@ export const jobChunks = sqliteTable(
     sent: int("sent").notNull().default(0),
     failed: int("failed").notNull().default(0),
     completedAt: int("completed_at"),
+    /** Recipients in this chunk. */
+    total: int("total").notNull().default(0),
+    /** Send round, 0 = first attempt. A queue message only acts on the round
+     *  it names; each retry round is claimed before it is enqueued. */
+    round: int("round").notNull().default(0),
+    /** JSON array of chunk-relative recipient indexes still to send in
+     *  `round`; null means every recipient (round 0). */
+    retryIndexes: text("retry_indexes"),
+    /** Byte range of this chunk's NDJSON line in the R2 payload; null for a
+     *  legacy single-document payload. */
+    payloadOffset: int("payload_offset"),
+    payloadLength: int("payload_length"),
+    /** Fresh per claim, so the job rollup batched with the claim only applies
+     *  when the claim itself matched (see settleChunkRound). */
+    claimToken: text("claim_token"),
+    /** Last progress: insert, round claim, or requeue. The reaper re-enqueues
+     *  pending chunks idle for longer than CHUNK_STALE_SECONDS. */
+    updatedAt: int("updated_at").notNull().default(0),
+    /** Times the reaper re-enqueued this chunk. */
+    requeues: int("requeues").notNull().default(0),
   },
-  (t) => [primaryKey({ columns: [t.jobId, t.chunkIndex] })],
+  (t) => [
+    primaryKey({ columns: [t.jobId, t.chunkIndex] }),
+    index("job_chunks_status_updated_idx").on(t.status, t.updatedAt),
+  ],
 );
 
 export const messages = sqliteTable(
@@ -140,4 +176,34 @@ export const messages = sqliteTable(
     index("messages_job_idx").on(t.jobId),
     index("messages_created_idx").on(t.createdAt),
   ],
+);
+
+/** Stored responses for `Idempotency-Key` requests (src/api/idempotency.ts). */
+export const idempotencyKeys = sqliteTable(
+  "idempotency_keys",
+  {
+    appId: int("app_id").notNull(),
+    key: text("key").notNull(),
+    /** sha256 of method + path + raw body; a reused key with a different
+     *  request is rejected rather than replayed. */
+    requestHash: text("request_hash").notNull(),
+    /** Null while the first request is still in flight. */
+    responseStatus: int("response_status"),
+    responseBody: text("response_body"),
+    createdAt: int("created_at").notNull(),
+    lockedAt: int("locked_at").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.appId, t.key] }), index("idempotency_keys_created_idx").on(t.createdAt)],
+);
+
+/** Per-App recipient counter for the daily quota (apps.daily_quota). */
+export const appUsage = sqliteTable(
+  "app_usage",
+  {
+    appId: int("app_id").notNull(),
+    /** UTC calendar day, YYYY-MM-DD. */
+    day: text("day").notNull(),
+    recipients: int("recipients").notNull().default(0),
+  },
+  (t) => [primaryKey({ columns: [t.appId, t.day] })],
 );

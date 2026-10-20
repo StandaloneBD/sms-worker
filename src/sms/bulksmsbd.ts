@@ -4,11 +4,20 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
-import { ProviderTransportError } from "./errors";
+import { ProviderTransportError, failureForStatus, failureOf } from "./errors";
 
 const SMS_URL = "https://bulksmsbd.net/api/smsapi";
 const SMS_MANY_URL = "https://bulksmsbd.net/api/smsapimany";
 const ACCEPTED_CODE = 202;
+/**
+ * The provider's "Invalid Number" code. It is the only decline that is about
+ * a recipient rather than the account/sender (balance, sender id, IP
+ * whitelist, ...), but the provider answers once per request, so it can only
+ * be pinned on a recipient when the request carried exactly one. In a batch
+ * it is unattributable and counts as a provider-side refusal: the batch
+ * fails over to a provider that reports per recipient.
+ */
+const INVALID_NUMBER_CODE = 1001;
 
 const JSON_CONTENT_TYPE = "application/json";
 const FORM_CONTENT_TYPE = "application/x-www-form-urlencoded";
@@ -129,7 +138,7 @@ export class BulkSmsBd implements ISmsProvider {
             reason,
           }),
         );
-        outcome = { accepted: false, reason };
+        outcome = { accepted: false, reason, failure: failureOf(err) };
       }
 
       for (let index = 0; index < chunk.length; index++) {
@@ -152,7 +161,7 @@ export class BulkSmsBd implements ISmsProvider {
     contentType: string,
     requestBody: string | URLSearchParams,
     timeoutMs: number,
-    metadata: Record<string, unknown>,
+    metadata: { recipientCount: number; messageLength: number },
   ): Promise<SmsSendOutcome> {
     console.log(JSON.stringify({ provider: "bulksmsbd", event: "sending", ...metadata }));
 
@@ -170,13 +179,18 @@ export class BulkSmsBd implements ISmsProvider {
       if (isAbortError(err)) {
         throw new ProviderTransportError("BulkSmsBd request timed out");
       }
-      throw err;
+      throw new ProviderTransportError(
+        `BulkSmsBd request failed: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
     } finally {
       clearTimeout(timeout);
     }
 
     if (!response.ok) {
-      throw new ProviderTransportError(`SMS request failed with status ${response.status}`);
+      throw new ProviderTransportError(`SMS request failed with status ${response.status}`, {
+        failure: failureForStatus(response.status),
+      });
     }
 
     let body: BulkSmsBdResponse;
@@ -188,7 +202,8 @@ export class BulkSmsBd implements ISmsProvider {
       );
     }
 
-    if (body.response_code === ACCEPTED_CODE) {
+    const responseCode = Number(body.response_code);
+    if (responseCode === ACCEPTED_CODE) {
       console.log(
         JSON.stringify({
           provider: "bulksmsbd",
@@ -209,6 +224,8 @@ export class BulkSmsBd implements ISmsProvider {
         ...metadata,
       }),
     );
-    return { accepted: false, reason };
+    const failure =
+      responseCode === INVALID_NUMBER_CODE && metadata.recipientCount === 1 ? "recipient" : "provider";
+    return { accepted: false, reason, failure };
   }
 }

@@ -51,12 +51,55 @@ export const MAX_VARS_KEYS = 20;
  *  rendered template value ends up inline in the message body anyway. */
 export const MAX_VAR_VALUE_LENGTH = MAX_MESSAGE_LENGTH;
 
-/** History retention (Q9); enforced by the nightly cron. */
+/** History retention (Q9); enforced by the cron's purge step. */
 export const RETENTION_DAYS = 90;
 
-/** Chunk retry backoff: RETRY_BASE_SECONDS * 2^attempt, capped. */
+/** Daily-quota usage rows are kept this long (for the admin view), then purged. */
+export const USAGE_RETENTION_DAYS = 7;
+/** UTC calendar day (YYYY-MM-DD) that daily-quota usage is counted under. */
+export const usageDay = (date: Date = new Date()): string => date.toISOString().slice(0, 10);
+
+/** Chunk retry backoff after an infrastructure error (D1/R2 unavailable):
+ *  RETRY_BASE_SECONDS * 2^attempt, capped. */
 export const RETRY_BASE_SECONDS = 30;
 export const RETRY_MAX_SECONDS = 3600;
+
+/** Send rounds per chunk: round 0 plus up to SEND_ROUNDS - 1 retries of the
+ *  recipients every provider failed retryably (transport or provider-side,
+ *  see FailureKind). Round n ≥ 1 is enqueued with a delay of
+ *  SEND_RETRY_BASE_SECONDS * 2^(n-1): 60s, 120s, 240s. */
+export const SEND_ROUNDS = 4;
+export const SEND_RETRY_BASE_SECONDS = 60;
+
+/** Reaper (cron): a pending chunk with no progress for this long is
+ *  re-enqueued. Has to outlast one round's whole queue retry span (≈31 min
+ *  of RETRY_* backoff on sms-jobs, then the DLQ's retries) plus a send-round
+ *  delay, so a chunk that is merely slow is never double-enqueued. */
+export const CHUNK_STALE_SECONDS = 2 * 60 * 60;
+/** Re-enqueues of one chunk before the reaper fails it outright. */
+export const CHUNK_MAX_REQUEUES = 3;
+/** Chunks re-enqueued / force-failed per cron run (D1 query budget). */
+export const REAPER_REQUEUE_BATCH = 50;
+export const REAPER_FAIL_BATCH = 5;
+
+/** Retention purge, per table per cron run: up to PURGE_MAX_BATCHES deletes
+ *  of PURGE_BATCH_ROWS rows each, so one run stays inside the D1 query and
+ *  duration budget and the cron catches up across runs. */
+export const PURGE_BATCH_ROWS = 1000;
+export const PURGE_MAX_BATCHES = 5;
+
+/** Idempotency-Key: how long a stored response is replayed, and how long a
+ *  claim whose request never finished (crashed isolate) blocks a retry
+ *  before the retry may take it over. */
+export const IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60;
+export const IDEMPOTENCY_LOCK_SECONDS = 120;
+export const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
+
+/** Provider circuit breaker (per isolate): after this many consecutive
+ *  attempts that ended in transport failures only, the provider is tried
+ *  last for BREAKER_OPEN_SECONDS. */
+export const BREAKER_FAILURE_THRESHOLD = 3;
+export const BREAKER_OPEN_SECONDS = 60;
 
 /** Rows per batched INSERT — messages table has 10 bound params/row and D1
  *  caps at 100 bound parameters per statement. */
@@ -75,8 +118,17 @@ export const kvAppByKeyHash = (keyHash: string) => `app:key:${keyHash}`;
 export const KV_APP_CONFIG_PREFIX = "app:config:";
 export const kvAppConfig = (appId: number) => `${KV_APP_CONFIG_PREFIX}${appId}`;
 
-/** R2 object key for a Job payload. */
-export const r2JobKey = (jobId: string) => `jobs/${jobId}.json`;
+/** R2 keys. Everything a Job writes lives under `jobs/{jobId}/` (deleted when
+ *  the Job finishes; a bucket lifecycle rule on `jobs/` is the backstop). */
+export const r2JobPrefix = (jobId: string) => `jobs/${jobId}/`;
+/** NDJSON, one self-contained ChunkPayload per line (ADR 0005). */
+export const r2JobPayloadKey = (jobId: string) => `jobs/${jobId}/payload.ndjson`;
+/** Dispatch results of one chunk round, written right after the send so a
+ *  redelivery never sends the same round twice (ADR 0005). */
+export const r2ChunkResultsKey = (jobId: string, chunkIndex: number, round: number) =>
+  `jobs/${jobId}/results/${chunkIndex}-${round}.json`;
+/** Single-document payload of Jobs created before NDJSON payloads. */
+export const r2LegacyJobKey = (jobId: string) => `jobs/${jobId}.json`;
 
 /** Session cookie name for the admin UI. */
 export const SESSION_COOKIE = "sms_admin_session";

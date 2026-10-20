@@ -51,7 +51,7 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
     if (!row) {
       return c.json({ error: "unauthorized" }, 401);
     }
-    authed = { id: row.id, name: row.name, isActive: row.isActive };
+    authed = { id: row.id, name: row.name, isActive: row.isActive, dailyQuota: row.dailyQuota };
 
     // Refresh KV only when it's missing or stale so rotation/deactivation
     // aren't undone by a write racing an already-correct cache. KV writes

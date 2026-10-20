@@ -17,6 +17,7 @@ import { clearSession, createSession, readSession } from "../session";
 import { formRaw } from "../util";
 
 const INVALID_CREDENTIALS = "Invalid username or password.";
+const TOO_MANY_ATTEMPTS = "Too many sign-in attempts. Wait a minute and try again.";
 const BOOTSTRAP_USERNAME = "admin";
 
 function LoginForm({ bootstrap }: { bootstrap: boolean }) {
@@ -72,6 +73,10 @@ export async function loginPost(c: Context<AppEnv>): Promise<Response> {
     return redirectFlash(c, adminPath("/login"), "Username and password are required.", "error");
   }
 
+  if (!(await loginAllowed(c))) {
+    return redirectFlash(c, adminPath("/login"), TOO_MANY_ATTEMPTS, "error");
+  }
+
   const db = getDb(c.env);
   const adminCount = await countAdmins(db);
 
@@ -86,7 +91,7 @@ export async function loginPost(c: Context<AppEnv>): Promise<Response> {
     }
     const passwordHash = await hashPassword(password);
     const admin = await createAdmin(db, { username: BOOTSTRAP_USERNAME, passwordHash });
-    await createSession(c, admin.id);
+    await createSession(c, { adminId: admin.id, version: admin.sessionVersion });
     return c.redirect(adminPath("/"), 303);
   }
 
@@ -96,8 +101,23 @@ export async function loginPost(c: Context<AppEnv>): Promise<Response> {
     return redirectFlash(c, adminPath("/login"), INVALID_CREDENTIALS, "error");
   }
 
-  await createSession(c, admin.id);
+  await createSession(c, { adminId: admin.id, version: admin.sessionVersion });
   return c.redirect(adminPath("/"), 303);
+}
+
+/** Per-client-IP attempt limit (LOGIN_LIMITER binding) against password
+ *  guessing. Fails open if the limiter itself errors. */
+async function loginAllowed(c: Context<AppEnv>): Promise<boolean> {
+  const ip = c.req.header("cf-connecting-ip") ?? "unknown";
+  try {
+    const { success } = await c.env.LOGIN_LIMITER.limit({ key: `login:${ip}` });
+    return success;
+  } catch (err) {
+    console.warn(
+      JSON.stringify({ event: "login_rate_limit_failed", error: err instanceof Error ? err.message : String(err) }),
+    );
+    return true;
+  }
 }
 
 export async function logoutPost(c: Context<AppEnv>): Promise<Response> {

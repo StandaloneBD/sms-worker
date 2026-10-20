@@ -13,17 +13,19 @@ import {
   deleteMaskingProfile,
   deleteTemplate,
   getAppById,
+  getAppUsage,
   listApps,
   listMaskingProfiles,
   listTemplates,
   rotateAppKey,
   setAppActive,
+  setAppDailyQuota,
   upsertAppProvider,
 } from "../../db/queries";
 import { invalidateAppConfig } from "../../core/plan";
 import { invalidateAppAuthCache, writeAppAuthCache } from "../../core/auth-cache";
 import { encryptSecret, generateApiKey } from "../../shared/crypto";
-import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH } from "../../shared/constants";
+import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH, usageDay } from "../../shared/constants";
 import { PROVIDER_NAMES } from "../../shared/types";
 import type { AppEnv, ProviderName } from "../../shared/types";
 import { Breadcrumb, Empty, Kv, NotFoundPage, PageHeader, Panel, Segments } from "../components";
@@ -161,10 +163,11 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
     return c.html(<NotFoundPage flash={readFlash(c)} what="App" />, 404);
   }
 
-  const [providerRows, profiles, templates] = await Promise.all([
+  const [providerRows, profiles, templates, usedToday] = await Promise.all([
     getAppProviderRows(db, id),
     listMaskingProfiles(db, id),
     listTemplates(db, id),
+    getAppUsage(db, id, usageDay()),
   ]);
   const flash = readFlash(c);
 
@@ -208,8 +211,42 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
             },
             { label: "Key prefix", value: <span class="mono">{app.keyPrefix}</span> },
             { label: "Created", value: <span class="mono">{formatTs(app.createdAt)}</span> },
+            {
+              label: "Recipients today (UTC)",
+              value: (
+                <span class="mono">
+                  {app.dailyQuota === null ? `${usedToday} · no quota` : `${usedToday} / ${app.dailyQuota}`}
+                </span>
+              ),
+            },
           ]}
         />
+      </Panel>
+
+      <Panel title="Daily quota">
+        <form method="post" action={adminPath(`/apps/${app.id}/quota`)}>
+          <div class="field field-narrow">
+            <label for="daily-quota">Max recipients per UTC day</label>
+            <input
+              class="input"
+              type="number"
+              id="daily-quota"
+              name="dailyQuota"
+              min={1}
+              value={app.dailyQuota === null ? "" : String(app.dailyQuota)}
+              placeholder="unlimited"
+            />
+          </div>
+          <p class="hint">
+            Sends and jobs that would take the app past this get a 429. Bounds what a leaked API key can
+            cost. Leave blank for no limit.
+          </p>
+          <div class="form-actions">
+            <button type="submit" class="btn btn-primary">
+              Save quota
+            </button>
+          </div>
+        </form>
       </Panel>
 
       <Panel title="Provider plan" flush>
@@ -226,7 +263,10 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
               <tbody>
                 {providerRows.map((row) => (
                   <tr>
-                    <td>{PROVIDER_LABELS[row.provider]}</td>
+                    <td>
+                      {PROVIDER_LABELS[row.provider]}
+                      {row.globallyEnabled ? null : <span class="muted"> · disabled globally</span>}
+                    </td>
                     <td>
                       <input
                         class="check"
@@ -438,6 +478,35 @@ async function notFoundOrRedirect(c: Context<AppEnv>, flash?: Flash): Promise<Re
   return c.html(<NotFoundPage flash={flash} what="App" />, 404);
 }
 
+export async function appQuotaPost(c: Context<AppEnv>): Promise<Response> {
+  const id = parseId(c.req.param("id"));
+  if (id === null) return notFoundOrRedirect(c);
+  const db = getDb(c.env);
+  const app = await getAppById(db, id);
+  if (!app) return notFoundOrRedirect(c);
+
+  const body = await c.req.parseBody();
+  const raw = formStr(body.dailyQuota);
+  const quota = raw === "" ? null : Number(raw);
+  if (quota !== null && (!Number.isInteger(quota) || quota < 1)) {
+    return redirectFlash(c, adminPath(`/apps/${id}`), "Daily quota must be a whole number of at least 1.", "error");
+  }
+  await setAppDailyQuota(db, id, quota);
+  // Auth reads D1 first, so the next request already sees the new quota;
+  // the cached verdict is refreshed so a D1 outage doesn't serve the old one.
+  await writeAppAuthCache(c.env, app.keyHash, {
+    id: app.id,
+    name: app.name,
+    isActive: app.isActive,
+    dailyQuota: quota,
+  });
+  return redirectFlash(
+    c,
+    adminPath(`/apps/${id}`),
+    quota === null ? "Daily quota removed." : `Daily quota set to ${quota} recipients.`,
+  );
+}
+
 export async function appActivePost(c: Context<AppEnv>): Promise<Response> {
   const id = parseId(c.req.param("id"));
   if (id === null) return notFoundOrRedirect(c);
@@ -450,7 +519,12 @@ export async function appActivePost(c: Context<AppEnv>): Promise<Response> {
   await setAppActive(db, id, desired);
   // Overwrite (not delete) so an outage-time request sees 403 rather than
   // 503 for a key we know is deactivated (ADR 0003).
-  await writeAppAuthCache(c.env, app.keyHash, { id: app.id, name: app.name, isActive: desired });
+  await writeAppAuthCache(c.env, app.keyHash, {
+    id: app.id,
+    name: app.name,
+    isActive: desired,
+    dailyQuota: app.dailyQuota,
+  });
   return redirectFlash(
     c,
     adminPath(`/apps/${id}`),

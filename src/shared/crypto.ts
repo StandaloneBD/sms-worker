@@ -135,12 +135,44 @@ export async function verifyPassword(password: string, stored: string): Promise<
 }
 
 /* ------------------------------------------------------------------ */
-/* Secrets at rest (masking profile API keys)                          */
+/* Worker secrets                                                       */
 /* ------------------------------------------------------------------ */
 
+const MIN_SECRET_LENGTH = 16;
+
+/**
+ * Reads a required worker secret, refusing a missing or short one. Without
+ * this an unset ENCRYPTION_KEY silently derives the AES key from the empty
+ * string — SHA-256(""), a public constant — and "encrypts" every provider
+ * API key with it.
+ */
+function requireSecret(env: Env, name: "ENCRYPTION_KEY" | "SESSION_SECRET"): string {
+  const value: unknown = env[name];
+  if (typeof value !== "string" || value.length < MIN_SECRET_LENGTH) {
+    throw new Error(
+      `${name} is not configured: set it with \`wrangler secret put ${name}\` (at least ${MIN_SECRET_LENGTH} characters)`,
+    );
+  }
+  return value;
+}
+
+/* ------------------------------------------------------------------ */
+/* Secrets at rest (provider + masking profile API keys)               */
+/* ------------------------------------------------------------------ */
+
+/** Imported once per isolate (per secret value) rather than per call — the
+ *  dispatch plan decrypts a key per provider on every send. */
+let aesKeyCache: { secret: string; key: Promise<CryptoKey> } | undefined;
+
 async function getAesKey(env: Env): Promise<CryptoKey> {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.ENCRYPTION_KEY));
-  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
+  const secret = requireSecret(env, "ENCRYPTION_KEY");
+  if (aesKeyCache?.secret !== secret) {
+    const key = crypto.subtle
+      .digest("SHA-256", new TextEncoder().encode(secret))
+      .then((digest) => crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]));
+    aesKeyCache = { secret, key };
+  }
+  return aesKeyCache.key;
 }
 
 /** Output format: `base64(iv):base64(ciphertext)`. AES-256-GCM. */
@@ -171,36 +203,53 @@ export async function decryptSecret(env: Env, ciphertext: string): Promise<strin
 async function getHmacKey(env: Env): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(env.SESSION_SECRET),
+    new TextEncoder().encode(requireSecret(env, "SESSION_SECRET")),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign", "verify"],
   );
 }
 
-/** Format: `<adminId>.<exp>.<base64url(HMAC-SHA256(SESSION_SECRET, adminId + "." + exp))>`. */
-export async function signSession(env: Env, adminId: number, expiresAtEpochSeconds: number): Promise<string> {
-  const payload = `${adminId}.${expiresAtEpochSeconds}`;
+export interface SessionClaims {
+  adminId: number;
+  /** admins.session_version at sign-in; a password change bumps the row's
+   *  version, which invalidates every token signed with an older one. */
+  version: number;
+}
+
+/** Format: `<adminId>.<version>.<exp>.<base64url(HMAC-SHA256(SESSION_SECRET, adminId.version.exp))>`. */
+export async function signSession(
+  env: Env,
+  claims: SessionClaims,
+  expiresAtEpochSeconds: number,
+): Promise<string> {
+  const payload = `${claims.adminId}.${claims.version}.${expiresAtEpochSeconds}`;
   const key = await getHmacKey(env);
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
   return `${payload}.${toBase64Url(new Uint8Array(signature))}`;
 }
 
-/** Verifies the HMAC (timing-safe) and expiry, returning the admin id or null. */
-export async function verifySession(env: Env, token: string): Promise<number | null> {
+/** Verifies the HMAC (timing-safe) and expiry, returning the claims or null.
+ *  The caller still checks `version` against the admin row. */
+export async function verifySession(env: Env, token: string): Promise<SessionClaims | null> {
   const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [adminIdStr, expStr, sig] = parts;
-  if (!adminIdStr || !expStr || !sig) return null;
+  if (parts.length !== 4) return null;
+  const [adminIdStr, versionStr, expStr, sig] = parts;
+  if (!adminIdStr || !versionStr || !expStr || !sig) return null;
 
   const adminId = Number(adminIdStr);
+  const version = Number(versionStr);
   const exp = Number(expStr);
-  if (!Number.isInteger(adminId) || !Number.isFinite(exp)) return null;
+  if (!Number.isInteger(adminId) || !Number.isInteger(version) || !Number.isFinite(exp)) return null;
   if (Math.floor(Date.now() / 1000) >= exp) return null;
 
   const key = await getHmacKey(env);
-  const expectedSig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${adminIdStr}.${expStr}`));
+  const expectedSig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(`${adminIdStr}.${versionStr}.${expStr}`),
+  );
   const expected = toBase64Url(new Uint8Array(expectedSig));
 
-  return timingSafeEqualStr(sig, expected) ? adminId : null;
+  return timingSafeEqualStr(sig, expected) ? { adminId, version } : null;
 }

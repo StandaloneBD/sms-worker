@@ -6,6 +6,7 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
+import { orderByHealth, recordReachable, recordTransportFailure } from "./health";
 
 /**
  * Ported from acadion's SmsService.ts (the provider-failover composite),
@@ -21,9 +22,13 @@ import type {
  * failed, which keeps the duplicate blast radius to that chunk rather than
  * the whole send.
  *
+ * Providers whose circuit breaker is open (see health.ts) are tried last.
+ *
  * Never throws for provider failures: returns an aggregated soft failure per
- * unresolved recipient so callers decide how loud to be. The result is
- * always the same length and order as the input recipients.
+ * unresolved recipient so callers decide how loud to be, flagged `retryable`
+ * when any provider failed it for a transport or provider-side reason (so a
+ * later attempt could succeed) rather than rejecting the recipient itself.
+ * The result is always the same length and order as the input recipients.
  */
 export async function dispatch(
   entries: DispatchPlanEntry[],
@@ -40,10 +45,12 @@ export async function dispatch(
   // reporting a single failed recipient must not be handed the reasons that
   // belong to everyone else in the batch.
   const reasons: string[][] = recipients.map(() => []);
+  const retryable: boolean[] = recipients.map(() => false);
   let pending = recipients.map((_, index) => index);
 
-  for (const entry of entries) {
+  for (const entry of orderByHealth(entries)) {
     if (pending.length === 0) break;
+    const name = entry.provider.name;
 
     let results: SmsSendOutcome[];
     try {
@@ -52,11 +59,14 @@ export async function dispatch(
       const reason = err instanceof Error ? err.message : String(err);
       for (const index of pending) {
         reasons[index]?.push(reason);
+        retryable[index] = true;
       }
+      recordTransportFailure(name);
       continue;
     }
 
     const stillPending: number[] = [];
+    let answered = false;
     for (const [slot, index] of pending.entries()) {
       // A provider returning fewer outcomes than recipients would otherwise
       // read as `undefined` here and silently drop the recipient because
@@ -64,17 +74,22 @@ export async function dispatch(
       const outcome = results.at(slot);
       if (!outcome) {
         reasons[index]?.push("provider returned no outcome");
+        retryable[index] = true;
         stillPending.push(index);
         continue;
       }
+      if (outcome.accepted || outcome.failure !== "transport") answered = true;
       if (outcome.accepted) {
         outcomes[index] = outcome;
-        acceptedBy[index] = entry.provider.name;
+        acceptedBy[index] = name;
         continue;
       }
       reasons[index]?.push(outcome.reason ?? "provider declined");
+      if (outcome.failure !== "recipient") retryable[index] = true;
       stillPending.push(index);
     }
+    if (answered) recordReachable(name);
+    else recordTransportFailure(name);
     pending = stillPending;
   }
 
@@ -83,7 +98,7 @@ export async function dispatch(
     // the top of this function), so this index is always in bounds.
     const to = recipients[index] as string;
     if (outcome) {
-      return { ...outcome, to, provider: acceptedBy[index] ?? null };
+      return { ...outcome, to, provider: acceptedBy[index] ?? null, retryable: false };
     }
     const failures = reasons[index] ?? [];
     return {
@@ -94,6 +109,7 @@ export async function dispatch(
         failures.length > 0
           ? `All SMS providers failed: ${failures.join("; ")}`
           : "No SMS providers configured",
+      retryable: retryable[index] ?? false,
     };
   });
 }
@@ -112,4 +128,17 @@ function attempt(
   }
   const subset = pending.map((index) => input.messages[index] as SmsDynamicMessage);
   return provider.sendDynamic(subset);
+}
+
+/**
+ * Builds the dispatch input for a list of resolved sends: "uniform" (one
+ * body, one-to-many endpoint) whenever every body is identical, otherwise
+ * "dynamic". Shared by the sync route and the queue consumer.
+ */
+export function toDispatchInput(sends: ReadonlyArray<{ to: string; body: string }>): DispatchInput {
+  const first = sends[0];
+  if (first && sends.every((send) => send.body === first.body)) {
+    return { kind: "uniform", message: first.body, recipients: sends.map((send) => send.to) };
+  }
+  return { kind: "dynamic", messages: sends.map((send) => ({ to: send.to, message: send.body })) };
 }

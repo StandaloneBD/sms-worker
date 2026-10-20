@@ -4,7 +4,7 @@
  * handle every other query helper takes — src/db itself is untouched.
  */
 
-import { asc, eq, gte, sql } from "drizzle-orm";
+import { asc, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "../db/queries";
 import { getGlobalProviders, listApps } from "../db/queries";
 import { admins, apps, appProviders, jobs, messages } from "../db/schema";
@@ -30,6 +30,9 @@ export interface AppProviderRow {
   provider: ProviderName;
   enabled: boolean;
   priority: number;
+  /** False when the admin disabled the provider globally — a kill switch
+   *  that overrides `enabled` here (see getAppProviderPlan). */
+  globallyEnabled: boolean;
 }
 
 /**
@@ -57,10 +60,11 @@ export async function getAppProviderRows(db: Db, appId: number): Promise<AppProv
   const globalMap = new Map(globals.map((g) => [g.provider, g]));
 
   return PROVIDER_NAMES.map((provider) => {
-    const override = overrideMap.get(provider);
-    if (override) return override;
     const global = globalMap.get(provider);
-    return { provider, enabled: global?.enabled ?? false, priority: global?.priority ?? 100 };
+    const globallyEnabled = global?.enabled ?? false;
+    const override = overrideMap.get(provider);
+    if (override) return { ...override, globallyEnabled };
+    return { provider, enabled: globallyEnabled, priority: global?.priority ?? 100, globallyEnabled };
   });
 }
 
@@ -74,8 +78,9 @@ export interface DashboardStats {
 
 /**
  * Overview-page stat row. 3 D1 queries total: messages grouped by status
- * (last 24h), jobs grouped by status (all time — running/queued are always
- * "current"), and a count of active apps.
+ * (last 24h), queued/running jobs grouped by status (a jobs_status_idx seek,
+ * not a scan of every job ever — each sync send adds a jobs row), and a
+ * count of active apps.
  */
 export async function dashboardStats(db: Db): Promise<DashboardStats> {
   const since = Math.floor(Date.now() / 1000) - DAY_SECONDS;
@@ -86,7 +91,11 @@ export async function dashboardStats(db: Db): Promise<DashboardStats> {
       .from(messages)
       .where(gte(messages.createdAt, since))
       .groupBy(messages.status),
-    db.select({ status: jobs.status, count: sql<number>`count(*)` }).from(jobs).groupBy(jobs.status),
+    db
+      .select({ status: jobs.status, count: sql<number>`count(*)` })
+      .from(jobs)
+      .where(inArray(jobs.status, ["queued", "running"]))
+      .groupBy(jobs.status),
     db.select({ count: sql<number>`count(*)` }).from(apps).where(eq(apps.isActive, true)),
   ]);
 

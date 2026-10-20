@@ -10,6 +10,7 @@ import { getAdminById } from "../data";
 import { redirectFlash, readFlash } from "../flash";
 import { Layout } from "../layout";
 import { adminPath } from "../paths";
+import { createSession } from "../session";
 import { formRaw } from "../util";
 
 const MIN_PASSWORD_LENGTH = 8;
@@ -83,6 +84,8 @@ export async function settingsPost(c: Context<AppEnv>): Promise<Response> {
   }
 
   const newHash = await hashPassword(newPassword);
-  await updateAdminPassword(db, adminId, newHash);
-  return redirectFlash(c, adminPath("/settings"), "Password updated.");
+  const version = await updateAdminPassword(db, adminId, newHash);
+  // The bump signed out every session, this one included — re-issue it.
+  if (version !== undefined) await createSession(c, { adminId, version });
+  return redirectFlash(c, adminPath("/settings"), "Password updated. Other sessions were signed out.");
 }

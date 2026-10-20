@@ -3,26 +3,30 @@
  * provider dispatch happens first and its result is what the caller gets
  * back; D1 history writes happen after and are best-effort, wrapped so a
  * D1 failure never turns an accepted send into a failed response.
+ *
+ * Both POST routes run behind the per-App rate limit and `Idempotency-Key`
+ * support, and charge the App's daily recipient quota before sending.
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import {
   getDb,
   getJobForApp,
   getTemplate,
-  insertJobChunks,
-  insertJob,
+  insertBulkJob,
   insertMessages,
   jobs,
   listMessagesByJob,
-  markJobFailed,
+  markChunksStale,
+  type Db,
   type NewMessageRow,
 } from "../db";
-import { buildDispatchPlan } from "../core/plan";
-import { dispatch } from "../sms/dispatch";
+import { buildDispatchPlan, maskingProfileExists } from "../core/plan";
+import { deleteJobObjects, encodeJobPayload, writeJobPayload } from "../core/payload";
+import { dispatch, toDispatchInput } from "../sms/dispatch";
 import { isValidPhone } from "../sms/phone";
-import { renderTemplate } from "../sms/template";
+import { resolveBody } from "../sms/template";
 import {
   CHUNK_SIZE,
   MAX_BODY_BYTES,
@@ -30,16 +34,16 @@ import {
   MAX_MESSAGE_LENGTH,
   MAX_SYNC_BODY_BYTES,
   MAX_SYNC_RECIPIENTS,
-  r2JobKey,
 } from "../shared/constants";
 import type {
   AppEnv,
   ChunkQueueMessage,
-  DispatchInput,
   DispatchResultItem,
-  JobPayload,
+  JobPayloadHeader,
   JobRecipient,
 } from "../shared/types";
+import { idempotency } from "./idempotency";
+import { chargeDailyQuota, sendRateLimit } from "./limits";
 import {
   assertRecipientCount,
   fail,
@@ -65,6 +69,7 @@ interface SendFields {
   message?: string;
   templateId?: number;
   maskingProfile?: string;
+  maskingStrict?: boolean;
   recipients: unknown;
 }
 
@@ -86,28 +91,40 @@ function parseSendFields(raw: unknown): SendFields {
   if (obj.maskingProfile !== undefined && typeof obj.maskingProfile !== "string") {
     fail(400, `"maskingProfile" must be a string`);
   }
+  if (obj.maskingStrict !== undefined && typeof obj.maskingStrict !== "boolean") {
+    fail(400, `"maskingStrict" must be a boolean`);
+  }
 
   return {
     message: obj.message as string | undefined,
     templateId: obj.templateId as number | undefined,
     maskingProfile: obj.maskingProfile as string | undefined,
+    maskingStrict: obj.maskingStrict as boolean | undefined,
     recipients: obj.recipients,
   };
 }
 
-/** Body-source rule shared by both routes: an explicit per-recipient message
- *  wins, then a template render, then the request-level uniform message. */
-function computeBody(
-  recipient: RecipientInput,
-  opts: { message: string | undefined; templateBody: string | undefined },
-): string | undefined {
-  if (recipient.message !== undefined) return recipient.message;
-  if (opts.templateBody !== undefined) return renderTemplate(opts.templateBody, recipient.vars);
-  return opts.message;
+async function loadTemplateBody(db: Db, appId: number, templateId: number | undefined): Promise<string | undefined> {
+  if (templateId === undefined) return undefined;
+  const template = await getTemplate(db, appId, templateId);
+  if (!template) return fail(404, "template not found");
+  return template.body;
 }
 
-function hadOverride(recipient: RecipientInput): boolean {
-  return recipient.vars !== undefined || recipient.message !== undefined;
+/** A label that matches none of the App's masking profiles is almost always
+ *  a typo, and would otherwise send under the global sender identity. */
+async function assertMaskingProfile(c: Context<AppEnv>, db: Db, label: string | undefined): Promise<void> {
+  if (label === undefined) return;
+  if (!(await maskingProfileExists(c.env, db, c.var.app.id, label))) {
+    fail(400, `unknown masking profile "${label}"`);
+  }
+}
+
+/** A resolved body is sendable when non-empty and within MAX_MESSAGE_LENGTH. */
+function bodyProblem(body: string | undefined): string | null {
+  if (body === undefined || body.length === 0) return "no message body resolved";
+  if (body.length > MAX_MESSAGE_LENGTH) return `body exceeds ${MAX_MESSAGE_LENGTH} characters`;
+  return null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -116,7 +133,9 @@ function hadOverride(recipient: RecipientInput): boolean {
 
 smsRoutes.post(
   "/sms/send",
+  sendRateLimit,
   bodyLimit({ maxSize: MAX_SYNC_BODY_BYTES, onError: rejectOversizedBody }),
+  idempotency,
   async (c) => {
     const db = getDb(c.env);
     const app = c.var.app;
@@ -125,55 +144,39 @@ smsRoutes.post(
     const fields = parseSendFields(raw);
     const normalized = normalizeRecipients(fields.recipients);
     assertRecipientCount(normalized.length, MAX_SYNC_RECIPIENTS);
-
-    let templateBody: string | undefined;
-    if (fields.templateId !== undefined) {
-      const template = await getTemplate(db, app.id, fields.templateId);
-      if (!template) return fail(404, "template not found");
-      templateBody = template.body;
-    }
+    const templateBody = await loadTemplateBody(db, app.id, fields.templateId);
 
     // Body-source validation applies to every recipient, regardless of phone
     // validity — an invalid phone still needs a resolvable body to be a valid
     // request at all.
     const bodies: string[] = normalized.map((recipient, index) => {
-      const body = computeBody(recipient, { message: fields.message, templateBody });
-      if (body === undefined || body.length === 0) {
-        return fail(400, `recipients[${index}]: no message body resolved`);
-      }
-      if (body.length > MAX_MESSAGE_LENGTH) {
-        return fail(400, `recipients[${index}]: body exceeds ${MAX_MESSAGE_LENGTH} characters`);
-      }
-      return body;
+      const body = resolveBody(recipient, { message: fields.message, templateBody });
+      const problem = bodyProblem(body);
+      return problem === null ? (body as string) : fail(400, `recipients[${index}]: ${problem}`);
     });
+    await assertMaskingProfile(c, db, fields.maskingProfile);
 
     const validIndexes: number[] = [];
     normalized.forEach((recipient, index) => {
       if (isValidPhone(recipient.to)) validIndexes.push(index);
     });
-    const validRecipients = validIndexes.map((i) => normalized[i] as RecipientInput);
-    const validBodies = validIndexes.map((i) => bodies[i] as string);
+    await chargeDailyQuota(c, db, validIndexes.length);
 
-    const allSameBody = validBodies.length > 0 && validBodies.every((b) => b === validBodies[0]);
-    const anyOverride = validRecipients.some(hadOverride);
-    const uniform = allSameBody && !anyOverride;
-
-    const dispatchInput: DispatchInput = uniform
-      ? { kind: "uniform", message: validBodies[0] as string, recipients: validRecipients.map((r) => r.to) }
-      : {
-          kind: "dynamic",
-          messages: validRecipients.map((r, i) => ({ to: r.to, message: validBodies[i] as string })),
-        };
-
-    const { entries, warnings } = await buildDispatchPlan(c.env, db, app.id, fields.maskingProfile);
-    const dispatchResults =
-      validRecipients.length > 0 ? await dispatch(entries, dispatchInput) : [];
+    const dispatchInput = toDispatchInput(
+      validIndexes.map((i) => ({ to: (normalized[i] as RecipientInput).to, body: bodies[i] as string })),
+    );
+    const { entries, warnings } =
+      validIndexes.length > 0
+        ? await buildDispatchPlan(c.env, db, app.id, fields.maskingProfile, { maskingStrict: fields.maskingStrict })
+        : { entries: [], warnings: [] };
+    const dispatchResults = validIndexes.length > 0 ? await dispatch(entries, dispatchInput) : [];
 
     const results: DispatchResultItem[] = normalized.map((recipient) => ({
       to: recipient.to,
       accepted: false,
       reason: "invalid phone number",
       provider: null,
+      retryable: false,
     }));
     validIndexes.forEach((originalIndex, vi) => {
       const result = dispatchResults[vi];
@@ -186,14 +189,12 @@ smsRoutes.post(
     const nowSeconds = Math.floor(Date.now() / 1000);
 
     const jobBody: string | null =
-      fields.templateId !== undefined ? (templateBody ?? null) : uniform ? (validBodies[0] ?? null) : null;
+      templateBody ?? (dispatchInput.kind === "uniform" && validIndexes.length > 0 ? dispatchInput.message : null);
 
     // History write is best-effort and happens after the response is already
-    // decided (ADR 0002) — never awaited by the request itself. `insertJob`'s
-    // NewJobInput intentionally omits sent/failed/completedAt (those are only
-    // meaningful once dispatch has happened, which for a sync send is *now*),
-    // so this writes the jobs row directly via the schema table rather than
-    // through that helper.
+    // decided (ADR 0002) — never awaited by the request itself. A sync send
+    // is complete at insert time, so the jobs row is written whole here
+    // rather than through the bulk-job helper.
     c.executionCtx.waitUntil(
       (async () => {
         try {
@@ -251,7 +252,9 @@ smsRoutes.post(
 
 smsRoutes.post(
   "/sms/jobs",
+  sendRateLimit,
   bodyLimit({ maxSize: MAX_BODY_BYTES, onError: rejectOversizedBody }),
+  idempotency,
   async (c) => {
     const db = getDb(c.env);
     const app = c.var.app;
@@ -260,13 +263,7 @@ smsRoutes.post(
     const fields = parseSendFields(raw);
     const normalized = normalizeRecipients(fields.recipients);
     assertRecipientCount(normalized.length, MAX_JOB_RECIPIENTS);
-
-    let templateBody: string | undefined;
-    if (fields.templateId !== undefined) {
-      const template = await getTemplate(db, app.id, fields.templateId);
-      if (!template) return fail(404, "template not found");
-      templateBody = template.body;
-    }
+    const templateBody = await loadTemplateBody(db, app.id, fields.templateId);
 
     // Strict validation: unlike /sms/send, an invalid phone or missing body
     // rejects the whole request rather than becoming a soft per-recipient
@@ -274,61 +271,55 @@ smsRoutes.post(
     // that information back on.
     const offending: number[] = [];
     normalized.forEach((recipient, index) => {
-      const body = computeBody(recipient, { message: fields.message, templateBody });
-      const bodyOk = body !== undefined && body.length > 0 && body.length <= MAX_MESSAGE_LENGTH;
-      const phoneOk = isValidPhone(recipient.to);
-      if (!bodyOk || !phoneOk) offending.push(index);
+      const body = resolveBody(recipient, { message: fields.message, templateBody });
+      if (bodyProblem(body) !== null || !isValidPhone(recipient.to)) offending.push(index);
     });
     if (offending.length > 0) {
       return c.json({ error: "invalid recipients", indexes: offending.slice(0, 10) }, 400);
     }
+    await assertMaskingProfile(c, db, fields.maskingProfile);
+    await chargeDailyQuota(c, db, normalized.length);
 
-    const anyOverride = normalized.some(hadOverride);
     const jobId = crypto.randomUUID();
-    const chunkCount = Math.ceil(normalized.length / CHUNK_SIZE);
-
+    // The consumer resolves each body with the same resolveBody() rule, so
+    // the header carries exactly the sources validated above: the template
+    // when one is referenced, otherwise the request-level message.
+    const header: JobPayloadHeader = {
+      jobId,
+      appId: app.id,
+      ...(templateBody !== undefined
+        ? { templateId: fields.templateId, templateBody }
+        : fields.message !== undefined
+          ? { message: fields.message }
+          : {}),
+      ...(fields.maskingProfile !== undefined ? { maskingProfile: fields.maskingProfile } : {}),
+      ...(fields.maskingStrict ? { maskingStrict: true } : {}),
+    };
     const payloadRecipients: JobRecipient[] = normalized.map((recipient) => ({
       to: recipient.to,
       ...(recipient.message !== undefined ? { message: recipient.message } : {}),
       ...(recipient.vars !== undefined ? { vars: recipient.vars } : {}),
     }));
-
-    const payload: JobPayload = {
-      jobId,
-      appId: app.id,
-      // Uniform body is only meaningful when nothing renders it per-recipient.
-      ...(fields.templateId === undefined && !anyOverride && fields.message !== undefined
-        ? { message: fields.message }
-        : {}),
-      ...(fields.templateId !== undefined
-        ? { templateId: fields.templateId, templateBody: templateBody as string }
-        : {}),
-      ...(fields.maskingProfile !== undefined ? { maskingProfile: fields.maskingProfile } : {}),
-      chunkSize: CHUNK_SIZE,
-      recipients: payloadRecipients,
-    };
-
-    const r2Key = r2JobKey(jobId);
-    await c.env.PAYLOADS.put(r2Key, JSON.stringify(payload));
-
-    const jobBody: string | null =
-      fields.templateId !== undefined ? (templateBody as string) : (payload.message ?? null);
+    const { body: payload, chunks } = encodeJobPayload(header, payloadRecipients, CHUNK_SIZE);
+    await writeJobPayload(c.env, jobId, payload);
 
     try {
-      await insertJob(db, {
-        id: jobId,
-        appId: app.id,
-        kind: "bulk",
-        status: "queued",
-        body: jobBody,
-        templateId: fields.templateId ?? null,
-        maskingProfile: fields.maskingProfile ?? null,
-        total: normalized.length,
-        chunkCount,
-      });
-      await insertJobChunks(db, jobId, chunkCount);
+      await insertBulkJob(
+        db,
+        {
+          id: jobId,
+          appId: app.id,
+          kind: "bulk",
+          status: "queued",
+          body: templateBody ?? fields.message ?? null,
+          templateId: fields.templateId ?? null,
+          maskingProfile: fields.maskingProfile ?? null,
+          total: normalized.length,
+        },
+        chunks,
+      );
     } catch (err) {
-      await c.env.PAYLOADS.delete(r2Key).catch((delErr: unknown) => {
+      await deleteJobObjects(c.env, jobId).catch((delErr: unknown) => {
         console.warn(
           JSON.stringify({ event: "job_payload_cleanup_failed", jobId, error: String(delErr) }),
         );
@@ -344,36 +335,34 @@ smsRoutes.post(
       return fail(503, "job could not be recorded; try again");
     }
 
-    try {
-      const chunkMessages: ChunkQueueMessage[] = Array.from({ length: chunkCount }, (_, i) => ({
-        jobId,
-        chunkIndex: i,
-      }));
-      for (let offset = 0; offset < chunkMessages.length; offset += QUEUE_SEND_BATCH_LIMIT) {
-        const slice = chunkMessages.slice(offset, offset + QUEUE_SEND_BATCH_LIMIT);
+    // From here the Job is durably recorded (D1 + R2), so the request
+    // succeeds even if enqueueing fails partway: chunks already enqueued may
+    // be sending, and a 503 would invite the client to submit the whole Job
+    // again. The chunks that didn't make it are marked idle instead, and the
+    // next reaper run (cron, every 15 min) enqueues them.
+    const chunkMessages: ChunkQueueMessage[] = chunks.map((_, chunkIndex) => ({ jobId, chunkIndex, round: 0 }));
+    for (let offset = 0; offset < chunkMessages.length; offset += QUEUE_SEND_BATCH_LIMIT) {
+      const slice = chunkMessages.slice(offset, offset + QUEUE_SEND_BATCH_LIMIT);
+      try {
         await c.env.SMS_QUEUE.sendBatch(slice.map((body) => ({ body })));
-      }
-    } catch (err) {
-      console.error(
-        JSON.stringify({
-          event: "job_enqueue_failed",
-          jobId,
-          appId: app.id,
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      );
-      await markJobFailed(db, jobId, "failed to enqueue chunks").catch((markErr: unknown) => {
+      } catch (err) {
         console.error(
-          JSON.stringify({ event: "job_mark_failed_failed", jobId, error: String(markErr) }),
+          JSON.stringify({
+            event: "job_enqueue_failed",
+            jobId,
+            appId: app.id,
+            fromChunk: offset,
+            error: err instanceof Error ? err.message : String(err),
+          }),
         );
-      });
-      await c.env.PAYLOADS.delete(r2Key).catch(() => {
-        // best-effort; the job is already marked failed above
-      });
-      return fail(503, "job accepted but could not be queued");
+        await markChunksStale(db, jobId, { from: offset }).catch((markErr: unknown) => {
+          console.error(JSON.stringify({ event: "job_mark_stale_failed", jobId, error: String(markErr) }));
+        });
+        break;
+      }
     }
 
-    return c.json({ jobId, total: normalized.length, chunkCount }, 202);
+    return c.json({ jobId, total: normalized.length, chunkCount: chunks.length }, 202);
   },
 );
 

@@ -6,13 +6,20 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 0.5
+    // Unsampled: logs are per batch, not per recipient, and the error/warn
+    // lines are what answers "did this OTP go out?".
+    "head_sampling_rate": 1
   },
   // Custom domain; the zone must exist on this Cloudflare account.
   "routes": [{ "pattern": "sms.shihabmridha.com", "custom_domain": true }],
   "workers_dev": true,
   "vars": {
-    "FAKE_SMS": "false"
+    "FAKE_SMS": "false",
+    // Comma-separated browser origins allowed to call /v1 (CORS), or "*" for
+    // any. Empty disables CORS. The API is server-to-server; only list
+    // origins that genuinely call it from a browser, since any key used
+    // there is readable by that page's visitors.
+    "CORS_ORIGINS": "*"
   },
   "d1_databases": [
     {
@@ -38,14 +45,20 @@
   ],
   "queues": {
     "producers": [{ "binding": "SMS_QUEUE", "queue": "sms-jobs" }],
+    // The consumer routes by name: a queue whose name ends in "-dlq" is the
+    // dead-letter queue, every other queue is chunk processing — keep that
+    // suffix when renaming queues per environment.
     "consumers": [
       {
         "queue": "sms-jobs",
         // Workers Free allows 50 D1 queries per invocation; one chunk (250
         // recipients ≈ 25 batched inserts) per invocation stays under it.
-        // Parallelism comes from consumer autoscaling, not batch size.
         "max_batch_size": 1,
         "max_retries": 5,
+        // Caps parallel chunk sends: protects provider rate limits and keeps
+        // D1 (single writer) from returning "overloaded" mid-chunk, which
+        // would force a redelivery. ~5 × 250 recipients every few seconds.
+        "max_concurrency": 5,
         "dead_letter_queue": "sms-dlq"
       },
       {
@@ -58,6 +71,14 @@
       }
     ]
   },
-  // 21:00 UTC = 03:00 Asia/Dhaka — nightly history retention purge.
-  "triggers": { "crons": ["0 21 * * *"] }
+  "ratelimits": [
+    // Per App, on POST /v1/sms/send and /v1/sms/jobs. Bounds a runaway
+    // client; the per-App daily recipient quota (Admin → Apps) bounds spend.
+    { "name": "SEND_LIMITER", "namespace_id": "1001", "simple": { "limit": 120, "period": 60 } },
+    // Per client IP, on admin login attempts.
+    { "name": "LOGIN_LIMITER", "namespace_id": "1002", "simple": { "limit": 5, "period": 60 } }
+  ],
+  // Every 15 minutes: re-enqueue/fail stalled chunks, then a bounded slice of
+  // the retention purge (history, finished jobs, idempotency keys, usage).
+  "triggers": { "crons": ["*/15 * * * *"] }
 }

@@ -7,7 +7,7 @@
  * constants below.
  */
 
-import { and, asc, desc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import { HISTORY_INSERT_ROWS } from "../shared/constants";
@@ -15,7 +15,9 @@ import type { JobStatus, ProviderName } from "../shared/types";
 import {
   admins,
   appProviders,
+  appUsage,
   apps,
+  idempotencyKeys,
   jobChunks,
   jobs,
   maskingProfiles,
@@ -174,29 +176,31 @@ export async function upsertGlobalProvider(
  * any appProviders rows uses those exclusively (filtered to enabled,
  * ordered by priority); an App with none inherits the global
  * providerSettings defaults.
+ *
+ * The global `enabled` flag is a kill switch either way: a provider the
+ * admin disabled globally is never in any App's plan, whatever the App's
+ * own rows say.
  */
 export async function getAppProviderPlan(
   db: Db,
   appId: number,
 ): Promise<{ provider: ProviderName; priority: number }[]> {
-  const overrides = await db
-    .select({ provider: appProviders.provider, priority: appProviders.priority, enabled: appProviders.enabled })
-    .from(appProviders)
-    .where(eq(appProviders.appId, appId));
+  const [overrides, globals] = await Promise.all([
+    db
+      .select({ provider: appProviders.provider, priority: appProviders.priority, enabled: appProviders.enabled })
+      .from(appProviders)
+      .where(eq(appProviders.appId, appId)),
+    db
+      .select({ provider: providerSettings.provider, priority: providerSettings.priority, enabled: providerSettings.enabled })
+      .from(providerSettings)
+      .orderBy(asc(providerSettings.priority)),
+  ]);
 
-  if (overrides.length > 0) {
-    return overrides
-      .filter((row) => row.enabled)
-      .sort((a, b) => a.priority - b.priority)
-      .map((row) => ({ provider: row.provider, priority: row.priority }));
-  }
-
-  const defaults = await db
-    .select({ provider: providerSettings.provider, priority: providerSettings.priority })
-    .from(providerSettings)
-    .where(eq(providerSettings.enabled, true))
-    .orderBy(asc(providerSettings.priority));
-  return defaults;
+  const globallyEnabled = new Set(globals.filter((row) => row.enabled).map((row) => row.provider));
+  const rows = overrides.length > 0 ? [...overrides].sort((a, b) => a.priority - b.priority) : globals;
+  return rows
+    .filter((row) => row.enabled && globallyEnabled.has(row.provider))
+    .map((row) => ({ provider: row.provider, priority: row.priority }));
 }
 
 export async function upsertAppProvider(
@@ -323,26 +327,61 @@ export type NewJobInput = Omit<
   "createdAt" | "sent" | "failed" | "chunksDone" | "completedAt" | "error"
 >;
 
-export async function insertJob(db: Db, job: NewJobInput) {
-  const rows = await db
-    .insert(jobs)
-    .values({ ...job, createdAt: now() })
-    .returning();
-  return firstOrThrow(rows, "insertJob");
-}
-
-/** 2 bound params/row (jobId, chunkIndex); 50 rows/statement stays at the 100-param D1 cap. */
-const JOB_CHUNK_INSERT_ROWS = 50;
 const MAX_STATEMENTS_PER_BATCH = 20;
 
-export async function insertJobChunks(db: Db, jobId: string, chunkCount: number): Promise<void> {
-  if (chunkCount <= 0) return;
-  const indexes = Array.from({ length: chunkCount }, (_, i) => i);
-  const rowGroups = chunkArray(indexes, JOB_CHUNK_INSERT_ROWS);
-  const statements = rowGroups.map((group) =>
-    db.insert(jobChunks).values(group.map((chunkIndex) => ({ jobId, chunkIndex }))),
-  );
-  await runBatched(db, statements, MAX_STATEMENTS_PER_BATCH);
+/** One chunk's row data at Job creation: its recipient count and the byte
+ *  range of its line in the R2 payload. */
+export interface NewChunk {
+  total: number;
+  offset: number;
+  length: number;
+}
+
+/**
+ * Inserts a bulk Job row and all its chunk rows atomically (one db.batch),
+ * so a failure can't leave a 'queued' Job without chunks that nothing would
+ * ever finish. The chunk rows go in as ONE statement expanding a JSON array
+ * server-side with json_each: a multi-row VALUES insert would hit D1's
+ * 100-bound-parameter cap within a handful of rows, because drizzle binds
+ * every column default as a parameter too.
+ */
+export async function insertBulkJob(db: Db, job: NewJobInput, chunks: readonly NewChunk[]): Promise<void> {
+  const ts = now();
+  const rows = JSON.stringify(chunks.map((chunk) => [chunk.total, chunk.offset, chunk.length]));
+  await db.batch([
+    db.insert(jobs).values({ ...job, chunkCount: chunks.length, createdAt: ts }),
+    // INSERT ... SELECT lists every job_chunks column in schema order, so
+    // the SELECT yields them in that order too: job_id, chunk_index, status,
+    // sent, failed, completed_at, total, round, retry_indexes,
+    // payload_offset, payload_length, claim_token, updated_at, requeues.
+    db.insert(jobChunks).select(sql`
+      SELECT ${job.id}, CAST(key AS INTEGER), 'pending', 0, 0, NULL,
+             json_extract(value, '$[0]'), 0, NULL,
+             json_extract(value, '$[1]'), json_extract(value, '$[2]'), NULL, ${ts}, 0
+      FROM json_each(${rows})
+    `),
+  ]);
+}
+
+/** Marks a Job's pending chunks in [from, to] (to defaults to the last chunk)
+ *  as long idle, so the next reaper run enqueues them — used when
+ *  enqueueing them failed. */
+export async function markChunksStale(
+  db: Db,
+  jobId: string,
+  range: { from: number; to?: number },
+): Promise<void> {
+  await db
+    .update(jobChunks)
+    .set({ updatedAt: 0 })
+    .where(
+      and(
+        eq(jobChunks.jobId, jobId),
+        gte(jobChunks.chunkIndex, range.from),
+        range.to === undefined ? undefined : lte(jobChunks.chunkIndex, range.to),
+        eq(jobChunks.status, "pending"),
+      ),
+    );
 }
 
 export async function getJob(db: Db, id: string) {
@@ -383,68 +422,126 @@ export async function getJobChunk(db: Db, jobId: string, chunkIndex: number) {
 }
 
 /**
- * At-least-once idempotency gate + counter rollup in ONE atomic db.batch
- * (D1 batches commit or roll back as a unit), called AFTER a successful
- * dispatch — claiming first would turn a crash mid-send into silent message
- * loss, and ADR 0002 prefers duplicates over loss.
+ * Settles one send round of a chunk: the at-least-once idempotency gate and
+ * the job counter rollup in ONE atomic db.batch (D1 batches commit or roll
+ * back as a unit), called AFTER the round's dispatch — claiming first would
+ * turn a crash mid-send into silent message loss, and ADR 0002 prefers
+ * duplicates over loss.
  *
- * Statement 1 flips this chunk 'pending' → 'done' with its counts; statement
- * 2 recomputes the parent job's sent/failed/chunksDone as AGGREGATES over
- * job_chunks (not increments), so the rollup is idempotent and can never
- * leave a job stranded short of its terminal status: either both statements
- * commit, or neither did and queue redelivery re-runs the whole thing. When
- * every chunk is out of 'pending', status flips to 'completed' /
- * 'completed_with_errors' and completedAt is stamped.
+ * Statement 1 claims the chunk, matching only while it is still 'pending' in
+ * `round`: it adds this round's settled counts and either finishes the chunk
+ * ('done') or, when `retryIndexes` is non-empty, advances it to the next
+ * round with those recipients still to send. It stamps a fresh claim token.
+ * Statement 2 increments the parent job's counters, guarded on that token so
+ * it applies exactly when statement 1 matched, and moves its status
+ * (queued → running, or to its terminal status when this was the last chunk
+ * to finish). Increments, not aggregates recomputed over every chunk: each
+ * call touches O(1) rows however many chunks the job has.
  *
- * Returns false when a concurrent/redelivered handling already finished the
- * chunk — the caller skips history writes (the winner wrote them); the
- * harmless aggregate recompute in statement 2 still ran.
+ * `claimed` is false when a concurrent/redelivered handling already settled
+ * this round — the caller then skips history writes (the winner wrote them).
+ * `jobFinished` is true when this call moved the job to a terminal status.
  */
-export async function completeChunk(
+export async function settleChunkRound(
   db: Db,
-  input: { jobId: string; chunkIndex: number; sent: number; failed: number },
-): Promise<boolean> {
+  input: {
+    jobId: string;
+    chunkIndex: number;
+    round: number;
+    sent: number;
+    failed: number;
+    retryIndexes: readonly number[];
+  },
+): Promise<{ claimed: boolean; jobFinished: boolean }> {
   const ts = now();
-  const doneCount = sql`(SELECT COUNT(*) FROM ${jobChunks} WHERE ${jobChunks.jobId} = ${input.jobId} AND ${jobChunks.status} != 'pending')`;
-  const sentSum = sql`(SELECT COALESCE(SUM(${jobChunks.sent}), 0) FROM ${jobChunks} WHERE ${jobChunks.jobId} = ${input.jobId})`;
-  const failedSum = sql`(SELECT COALESCE(SUM(${jobChunks.failed}), 0) FROM ${jobChunks} WHERE ${jobChunks.jobId} = ${input.jobId})`;
+  const token = crypto.randomUUID();
+  const finishing = input.retryIndexes.length === 0;
+  const chunkDone = finishing ? 1 : 0;
+  const lastChunk = sql`${jobs.chunksDone} + ${chunkDone} >= ${jobs.chunkCount}`;
 
-  const [claim] = await db.batch([
+  const [claim, rollup] = await db.batch([
     db
       .update(jobChunks)
-      .set({ status: "done", sent: input.sent, failed: input.failed, completedAt: ts })
+      .set({
+        status: finishing ? "done" : "pending",
+        round: input.round + 1,
+        retryIndexes: finishing ? null : JSON.stringify(input.retryIndexes),
+        sent: sql`${jobChunks.sent} + ${input.sent}`,
+        failed: sql`${jobChunks.failed} + ${input.failed}`,
+        completedAt: finishing ? ts : null,
+        claimToken: token,
+        updatedAt: ts,
+      })
       .where(
         and(
           eq(jobChunks.jobId, input.jobId),
           eq(jobChunks.chunkIndex, input.chunkIndex),
           eq(jobChunks.status, "pending"),
+          eq(jobChunks.round, input.round),
         ),
       ),
     db
       .update(jobs)
       .set({
-        sent: sentSum,
-        failed: failedSum,
-        chunksDone: doneCount,
-        status: sql`CASE WHEN ${doneCount} >= ${jobs.chunkCount} THEN CASE WHEN ${failedSum} > 0 THEN 'completed_with_errors' ELSE 'completed' END ELSE ${jobs.status} END`,
-        completedAt: sql`CASE WHEN ${doneCount} >= ${jobs.chunkCount} THEN ${ts} ELSE ${jobs.completedAt} END`,
+        sent: sql`${jobs.sent} + ${input.sent}`,
+        failed: sql`${jobs.failed} + ${input.failed}`,
+        chunksDone: sql`${jobs.chunksDone} + ${chunkDone}`,
+        status: sql`CASE WHEN ${lastChunk} THEN (CASE WHEN ${jobs.failed} + ${input.failed} > 0 THEN 'completed_with_errors' ELSE 'completed' END) WHEN ${jobs.status} = 'queued' THEN 'running' ELSE ${jobs.status} END`,
+        completedAt: sql`CASE WHEN ${lastChunk} THEN ${ts} ELSE ${jobs.completedAt} END`,
       })
-      .where(eq(jobs.id, input.jobId)),
+      .where(
+        and(
+          eq(jobs.id, input.jobId),
+          sql`EXISTS (SELECT 1 FROM ${jobChunks} WHERE ${jobChunks.jobId} = ${input.jobId} AND ${jobChunks.chunkIndex} = ${input.chunkIndex} AND ${jobChunks.claimToken} = ${token})`,
+        ),
+      )
+      .returning({ status: jobs.status }),
   ]);
-  return claim.meta.changes > 0;
+
+  const claimed = claim.meta.changes > 0;
+  const status: JobStatus | undefined = rollup[0]?.status;
+  return {
+    claimed,
+    jobFinished: claimed && finishing && (status === "completed" || status === "completed_with_errors"),
+  };
 }
 
-export async function markJobFailed(db: Db, jobId: string, error: string): Promise<void> {
-  await db.update(jobs).set({ status: "failed", error, completedAt: now() }).where(eq(jobs.id, jobId));
+/**
+ * Reaper: claims up to `limit` pending chunks idle since before
+ * `staleBefore` that still have re-enqueues left — bumping their requeue
+ * count and progress stamp in the same statement, so two overlapping cron
+ * runs can't both pick a chunk — and returns them for re-enqueueing.
+ */
+export async function claimStaleChunks(
+  db: Db,
+  opts: { staleBefore: number; maxRequeues: number; limit: number },
+) {
+  return db
+    .update(jobChunks)
+    .set({ requeues: sql`${jobChunks.requeues} + 1`, updatedAt: now() })
+    .where(
+      sql`rowid IN (SELECT rowid FROM ${jobChunks} WHERE ${jobChunks.status} = 'pending' AND ${jobChunks.updatedAt} < ${opts.staleBefore} AND ${jobChunks.requeues} < ${opts.maxRequeues} ORDER BY ${jobChunks.updatedAt} LIMIT ${opts.limit})`,
+    )
+    .returning({ jobId: jobChunks.jobId, chunkIndex: jobChunks.chunkIndex, round: jobChunks.round });
 }
 
-export async function markJobRunning(db: Db, jobId: string): Promise<void> {
-  // Guarded on 'queued' so a late-redelivered chunk can never flip a job that
-  // already finished back to 'running'.
-  await db
-    .update(jobs)
-    .set({ status: "running" satisfies JobStatus })
-    .where(and(eq(jobs.id, jobId), eq(jobs.status, "queued")));
+/** Reaper: pending chunks idle since before `staleBefore` that have used up
+ *  their re-enqueues — to be force-finished. */
+export async function listAbandonedChunks(
+  db: Db,
+  opts: { staleBefore: number; maxRequeues: number; limit: number },
+) {
+  return db
+    .select({ jobId: jobChunks.jobId, chunkIndex: jobChunks.chunkIndex })
+    .from(jobChunks)
+    .where(
+      and(
+        eq(jobChunks.status, "pending"),
+        lt(jobChunks.updatedAt, opts.staleBefore),
+        gte(jobChunks.requeues, opts.maxRequeues),
+      ),
+    )
+    .limit(opts.limit);
 }
 
 /* ------------------------------------------------------------------ */
@@ -517,11 +614,108 @@ export async function createAdmin(db: Db, input: { username: string; passwordHas
   return firstOrThrow(rows, "createAdmin");
 }
 
-export async function updateAdminPassword(db: Db, id: number, passwordHash: string): Promise<boolean> {
-  const result = await db
+/** Sets a new password and bumps the session version, which signs out every
+ *  existing session. Returns the new version, or undefined for no such admin. */
+export async function updateAdminPassword(db: Db, id: number, passwordHash: string): Promise<number | undefined> {
+  const rows = await db
     .update(admins)
-    .set({ passwordHash, updatedAt: now() })
-    .where(eq(admins.id, id));
+    .set({ passwordHash, sessionVersion: sql`${admins.sessionVersion} + 1`, updatedAt: now() })
+    .where(eq(admins.id, id))
+    .returning({ sessionVersion: admins.sessionVersion });
+  return rows[0]?.sessionVersion;
+}
+
+/* ------------------------------------------------------------------ */
+/* Idempotency keys                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Claims `key` for a request. Succeeds for a new key, and takes over an
+ * existing one when it has expired (created before `expiredBefore`) or when
+ * the same request claimed it but never finished (locked before
+ * `lockExpiredBefore`, e.g. a crashed isolate). False means another request
+ * holds it — the caller reads the row to replay, reject, or report it busy.
+ */
+export async function claimIdempotencyKey(
+  db: Db,
+  input: { appId: number; key: string; requestHash: string; expiredBefore: number; lockExpiredBefore: number },
+): Promise<boolean> {
+  const ts = now();
+  const result = await db
+    .insert(idempotencyKeys)
+    .values({ appId: input.appId, key: input.key, requestHash: input.requestHash, createdAt: ts, lockedAt: ts })
+    .onConflictDoUpdate({
+      target: [idempotencyKeys.appId, idempotencyKeys.key],
+      set: { requestHash: input.requestHash, responseStatus: null, responseBody: null, createdAt: ts, lockedAt: ts },
+      setWhere: sql`${idempotencyKeys.createdAt} < ${input.expiredBefore} OR (${idempotencyKeys.responseStatus} IS NULL AND ${idempotencyKeys.lockedAt} < ${input.lockExpiredBefore} AND ${idempotencyKeys.requestHash} = ${input.requestHash})`,
+    });
+  return result.meta.changes > 0;
+}
+
+export async function getIdempotencyKey(db: Db, appId: number, key: string) {
+  const rows = await db
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.appId, appId), eq(idempotencyKeys.key, key)))
+    .limit(1);
+  return rows[0];
+}
+
+export async function completeIdempotencyKey(
+  db: Db,
+  input: { appId: number; key: string; status: number; body: string },
+): Promise<void> {
+  await db
+    .update(idempotencyKeys)
+    .set({ responseStatus: input.status, responseBody: input.body })
+    .where(and(eq(idempotencyKeys.appId, input.appId), eq(idempotencyKeys.key, input.key)));
+}
+
+/** Drops an unfinished claim so the client can retry the request. */
+export async function releaseIdempotencyKey(db: Db, appId: number, key: string): Promise<void> {
+  await db
+    .delete(idempotencyKeys)
+    .where(
+      and(eq(idempotencyKeys.appId, appId), eq(idempotencyKeys.key, key), isNull(idempotencyKeys.responseStatus)),
+    );
+}
+
+/* ------------------------------------------------------------------ */
+/* Daily quota                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Adds `count` recipients to the App's usage for `day` unless that would
+ * take it past `quota` — atomically, so concurrent requests can't both slip
+ * under. False means over quota; nothing was added.
+ */
+export async function consumeDailyQuota(
+  db: Db,
+  input: { appId: number; day: string; count: number; quota: number },
+): Promise<boolean> {
+  if (input.count > input.quota) return false;
+  const result = await db
+    .insert(appUsage)
+    .values({ appId: input.appId, day: input.day, recipients: input.count })
+    .onConflictDoUpdate({
+      target: [appUsage.appId, appUsage.day],
+      set: { recipients: sql`${appUsage.recipients} + ${input.count}` },
+      setWhere: sql`${appUsage.recipients} + ${input.count} <= ${input.quota}`,
+    });
+  return result.meta.changes > 0;
+}
+
+export async function getAppUsage(db: Db, appId: number, day: string): Promise<number> {
+  const rows = await db
+    .select({ recipients: appUsage.recipients })
+    .from(appUsage)
+    .where(and(eq(appUsage.appId, appId), eq(appUsage.day, day)))
+    .limit(1);
+  return rows[0]?.recipients ?? 0;
+}
+
+export async function setAppDailyQuota(db: Db, id: number, quota: number | null): Promise<boolean> {
+  const result = await db.update(apps).set({ dailyQuota: quota }).where(eq(apps.id, id));
   return result.meta.changes > 0;
 }
 
@@ -530,41 +724,66 @@ export async function updateAdminPassword(db: Db, id: number, passwordHash: stri
 /* ------------------------------------------------------------------ */
 
 /**
- * Nightly purge (ADR: RETENTION_DAYS). Deletes messages older than the
- * cutoff, then jobChunks/jobs older than the cutoff — jobs only when
- * terminal (completedAt is set, covering completed/completed_with_errors/
- * failed) and completedAt predates the cutoff.
+ * One cron run's slice of the retention purge (RETENTION_DAYS): message
+ * history older than the cutoff, then finished jobs created before it with
+ * their chunk rows. Each table is deleted in batches of `batchRows` — the
+ * ids picked by a LIMITed subquery, since D1's SQLite has no DELETE ... LIMIT
+ * — for at most `maxBatches` rounds, which keeps a run inside its query and
+ * duration budget while the 15-minute cron outpaces the write rate.
+ * Unfinished jobs are never purged; the reaper finishes stalled ones.
  */
 export async function purgeOlderThan(
   db: Db,
   days: number,
+  opts: { batchRows: number; maxBatches: number },
 ): Promise<{ messages: number; jobChunks: number; jobs: number }> {
   const cutoff = now() - days * 86400;
 
-  const messagesResult = await db.delete(messages).where(lt(messages.createdAt, cutoff));
-
-  // Capped per run so id lists never breach D1's 100-bound-param cap and the
-  // whole purge stays inside one invocation's query budget; the nightly cron
-  // catches up across runs.
-  const staleJobs = await db
-    .select({ id: jobs.id })
-    .from(jobs)
-    .where(and(isNotNull(jobs.completedAt), lt(jobs.completedAt, cutoff)))
-    .limit(400);
-  const staleJobIds = staleJobs.map((row) => row.id);
+  let messagesDeleted = 0;
+  for (let batch = 0; batch < opts.maxBatches; batch++) {
+    const ids = db.select({ id: messages.id }).from(messages).where(lt(messages.createdAt, cutoff)).limit(opts.batchRows);
+    const result = await db.delete(messages).where(inArray(messages.id, ids));
+    messagesDeleted += result.meta.changes;
+    if (result.meta.changes < opts.batchRows) break;
+  }
 
   let jobChunksDeleted = 0;
   let jobsDeleted = 0;
-  for (const idSlice of chunkArray(staleJobIds, 90)) {
-    const chunksResult = await db.delete(jobChunks).where(inArray(jobChunks.jobId, idSlice));
+  for (let batch = 0; batch < opts.maxBatches; batch++) {
+    // Same deterministic subquery in both statements of one transaction, so
+    // they agree on the set of jobs.
+    const ids = db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(and(lt(jobs.createdAt, cutoff), isNotNull(jobs.completedAt)))
+      .orderBy(asc(jobs.createdAt), asc(jobs.id))
+      .limit(opts.batchRows);
+    const [chunksResult, jobsResult] = await db.batch([
+      db.delete(jobChunks).where(inArray(jobChunks.jobId, ids)),
+      db.delete(jobs).where(inArray(jobs.id, ids)),
+    ]);
     jobChunksDeleted += chunksResult.meta.changes;
-    const jobsResult = await db.delete(jobs).where(inArray(jobs.id, idSlice));
     jobsDeleted += jobsResult.meta.changes;
+    if (jobsResult.meta.changes < opts.batchRows) break;
   }
 
-  return {
-    messages: messagesResult.meta.changes,
-    jobChunks: jobChunksDeleted,
-    jobs: jobsDeleted,
-  };
+  return { messages: messagesDeleted, jobChunks: jobChunksDeleted, jobs: jobsDeleted };
+}
+
+/** Idempotency keys past their replay window, and usage rows for days
+ *  before `beforeDay` (YYYY-MM-DD). */
+export async function purgeExpiredKeysAndUsage(
+  db: Db,
+  opts: { keysCreatedBefore: number; beforeDay: string; batchRows: number; maxBatches: number },
+): Promise<{ idempotencyKeys: number; appUsage: number }> {
+  let keysDeleted = 0;
+  for (let batch = 0; batch < opts.maxBatches; batch++) {
+    const result = await db.run(
+      sql`DELETE FROM ${idempotencyKeys} WHERE rowid IN (SELECT rowid FROM ${idempotencyKeys} WHERE ${idempotencyKeys.createdAt} < ${opts.keysCreatedBefore} LIMIT ${opts.batchRows})`,
+    );
+    keysDeleted += result.meta.changes;
+    if (result.meta.changes < opts.batchRows) break;
+  }
+  const usageResult = await db.delete(appUsage).where(lt(appUsage.day, opts.beforeDay));
+  return { idempotencyKeys: keysDeleted, appUsage: usageResult.meta.changes };
 }

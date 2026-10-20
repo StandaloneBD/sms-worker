@@ -11,9 +11,11 @@
 
 import type { Context, Next } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { getDb } from "../db";
 import { SESSION_COOKIE, SESSION_TTL_SECONDS } from "../shared/constants";
-import { signSession, verifySession } from "../shared/crypto";
+import { signSession, verifySession, type SessionClaims } from "../shared/crypto";
 import type { AppEnv } from "../shared/types";
+import { getAdminById } from "./data";
 import { adminPath } from "./paths";
 
 function isHttps(c: Context<AppEnv>): boolean {
@@ -21,9 +23,9 @@ function isHttps(c: Context<AppEnv>): boolean {
 }
 
 /** Signs a fresh session token (exp = now + SESSION_TTL_SECONDS) and sets the cookie. */
-export async function createSession(c: Context<AppEnv>, adminId: number): Promise<void> {
+export async function createSession(c: Context<AppEnv>, claims: SessionClaims): Promise<void> {
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
-  const token = await signSession(c.env, adminId, expiresAt);
+  const token = await signSession(c.env, claims, expiresAt);
   setCookie(c, SESSION_COOKIE, token, {
     httpOnly: true,
     sameSite: "Lax",
@@ -38,11 +40,19 @@ export function clearSession(c: Context<AppEnv>): void {
   deleteCookie(c, SESSION_COOKIE, { path: "/" });
 }
 
-/** Reads + verifies the session cookie, returning the admin id or null. Never logs the token. */
+/**
+ * Reads + verifies the session cookie, returning the admin id or null. Never
+ * logs the token. Beyond the signature and expiry, the admin must still
+ * exist and the token's session version must match the row's — a password
+ * change bumps it, signing out every other session.
+ */
 export async function readSession(c: Context<AppEnv>): Promise<number | null> {
   const token = getCookie(c, SESSION_COOKIE);
   if (!token) return null;
-  return verifySession(c.env, token);
+  const claims = await verifySession(c.env, token);
+  if (!claims) return null;
+  const admin = await getAdminById(getDb(c.env), claims.adminId);
+  return admin && admin.sessionVersion === claims.version ? admin.id : null;
 }
 
 /** Gate for every route registered after this middleware: no valid session → redirect to /login. */
