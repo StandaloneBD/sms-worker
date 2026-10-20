@@ -11,6 +11,7 @@ import { redirectFlash, readFlash } from "../flash";
 import { Layout } from "../layout";
 import { adminPath } from "../paths";
 import { createSession } from "../session";
+import { MAX_PASSWORD_LENGTH } from "../../shared/constants";
 import { formRaw } from "../util";
 
 const MIN_PASSWORD_LENGTH = 8;
@@ -68,11 +69,15 @@ export async function settingsPost(c: Context<AppEnv>): Promise<Response> {
   const currentPassword = formRaw(body.currentPassword);
   const newPassword = formRaw(body.newPassword);
 
-  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+  if (
+    newPassword.length < MIN_PASSWORD_LENGTH ||
+    newPassword.length > MAX_PASSWORD_LENGTH ||
+    currentPassword.length > MAX_PASSWORD_LENGTH
+  ) {
     return redirectFlash(
       c,
       adminPath("/settings"),
-      `New password must be at least ${MIN_PASSWORD_LENGTH} characters.`,
+      `Password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters.`,
       "error",
     );
   }

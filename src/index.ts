@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { HTTPException } from "hono/http-exception";
 import { apiRoutes } from "./api";
 import { adminRoutes } from "./ui";
 import { handleQueue } from "./queue/consumer";
@@ -48,6 +49,9 @@ app.notFound((c) =>
 );
 
 app.onError((err, c) => {
+  if (err instanceof HTTPException) {
+    return c.req.path.startsWith("/v1") ? c.json({ error: err.message }, err.status) : c.text(err.message, err.status);
+  }
   // Explicit structured handling — never passThroughOnException, never leak
   // stack traces to callers.
   console.error(

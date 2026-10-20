@@ -8,7 +8,8 @@
     "enabled": true,
     // Unsampled: logs are per batch, not per recipient, and the error/warn
     // lines are what answers "did this OTP go out?".
-    "head_sampling_rate": 1
+    "head_sampling_rate": 1,
+    "traces": { "enabled": true, "head_sampling_rate": 0.1 }
   },
   // Custom domain; the zone must exist on this Cloudflare account.
   "routes": [{ "pattern": "sms.shihabmridha.com", "custom_domain": true }],

@@ -37,7 +37,9 @@ const now = (): number => Math.floor(Date.now() / 1000);
  *  so walk it. */
 export function isUniqueConstraintError(err: unknown): boolean {
   for (let e: unknown = err; e instanceof Error; e = e.cause) {
-    if (e.message.toUpperCase().includes("UNIQUE")) return true;
+    // Drizzle's outer message includes SQL/parameters: an app named "Unique"
+    // must not turn an unrelated D1 error into an apparent name conflict.
+    if (/^(?:D1_ERROR:s*)?UNIQUE constraint failed:/i.test(e.message)) return true;
   }
   return false;
 }
@@ -129,21 +131,20 @@ export async function getGlobalProviders(db: Db) {
   return db.select().from(providerSettings).orderBy(asc(providerSettings.priority));
 }
 
-export async function upsertGlobalProvider(
-  db: Db,
-  input: {
-    provider: ProviderName;
-    enabled: boolean;
-    priority: number;
-    /** For each optional field: undefined = keep existing value, null = clear, string = set. */
-    senderId?: string | null;
-    username?: string | null;
-    senderName?: string | null;
-    apiKeyEnc?: string | null;
-  },
-) {
+export interface GlobalProviderInput {
+  provider: ProviderName;
+  enabled: boolean;
+  priority: number;
+  /** For each optional field: undefined = keep existing value, null = clear, string = set. */
+  senderId?: string | null;
+  username?: string | null;
+  senderName?: string | null;
+  apiKeyEnc?: string | null;
+}
+
+function globalProviderStatement(db: Db, input: GlobalProviderInput) {
   const ts = now();
-  const rows = await db
+  return db
     .insert(providerSettings)
     .values({
       provider: input.provider,
@@ -168,7 +169,17 @@ export async function upsertGlobalProvider(
       },
     })
     .returning();
+}
+
+export async function upsertGlobalProvider(db: Db, input: GlobalProviderInput) {
+  const rows = await globalProviderStatement(db, input);
   return firstOrThrow(rows, "upsertGlobalProvider");
+}
+
+/** Saves every provider row in one batch, so a failure can't half-apply. */
+export async function upsertGlobalProviders(db: Db, inputs: GlobalProviderInput[]): Promise<void> {
+  const [first, ...rest] = inputs.map((input) => globalProviderStatement(db, input));
+  if (first) await db.batch([first, ...rest]);
 }
 
 /**
@@ -216,6 +227,23 @@ export async function upsertAppProvider(
     })
     .returning();
   return firstOrThrow(rows, "upsertAppProvider");
+}
+
+/** Saves an App's whole provider plan in one batch. */
+export async function upsertAppProviders(
+  db: Db,
+  inputs: { appId: number; provider: ProviderName; enabled: boolean; priority: number }[],
+): Promise<void> {
+  const [first, ...rest] = inputs.map((input) =>
+    db
+      .insert(appProviders)
+      .values(input)
+      .onConflictDoUpdate({
+        target: [appProviders.appId, appProviders.provider],
+        set: { enabled: input.enabled, priority: input.priority },
+      }),
+  );
+  if (first) await db.batch([first, ...rest]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -404,7 +432,7 @@ export async function listJobs(db: Db, opts: { appId?: number; limit: number; of
     .select()
     .from(jobs)
     .where(where)
-    .orderBy(desc(jobs.createdAt))
+    .orderBy(desc(jobs.createdAt), desc(jobs.id))
     .limit(opts.limit)
     .offset(opts.offset);
 }

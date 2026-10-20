@@ -65,19 +65,19 @@ export async function authMiddleware(c: Context<AppEnv>, next: Next): Promise<Re
   await next();
 }
 
-/** CSRF guard for all POSTs: a present Origin header whose host differs from the request host is rejected. */
+/** Browser POSTs must come from the same origin, including scheme/port. */
 export async function csrfMiddleware(c: Context<AppEnv>, next: Next): Promise<Response | void> {
   if (c.req.method === "POST") {
-    const origin = c.req.header("Origin");
-    if (origin) {
-      let originHost: string;
+    if (c.req.header("Sec-Fetch-Site") === "cross-site") return c.text("Forbidden: cross-origin request", 403);
+    const source = c.req.header("Origin") ?? c.req.header("Referer");
+    if (source) {
+      let sourceOrigin: string;
       try {
-        originHost = new URL(origin).host;
+        sourceOrigin = new URL(source).origin;
       } catch {
         return c.text("Forbidden: invalid Origin", 403);
       }
-      const requestHost = new URL(c.req.url).host;
-      if (originHost !== requestHost) {
+      if (sourceOrigin !== new URL(c.req.url).origin) {
         return c.text("Forbidden: cross-origin request", 403);
       }
     }

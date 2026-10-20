@@ -5,13 +5,15 @@
  */
 
 import { Hono } from "hono";
-import { getAppProviderPlan, getDb, listMaskingProfiles, upsertAppProvider } from "../db";
+import { getAppProviderPlan, getDb, listMaskingProfiles, upsertAppProviders } from "../db";
+import { requestBodyLimit } from "../shared/body-limit";
 import { invalidateAppConfig } from "../core/plan";
 import { PROVIDER_NAMES } from "../shared/types";
 import type { AppEnv, ProviderName } from "../shared/types";
 import { fail, readJsonBody } from "./validate";
 
 export const providersRoutes = new Hono<AppEnv>();
+providersRoutes.use("*", requestBodyLimit(64 * 1024));
 
 interface ProviderRowInput {
   provider: ProviderName;
@@ -23,6 +25,8 @@ const PROVIDER_NAME_SET: readonly string[] = PROVIDER_NAMES;
 
 function parseProviderRows(raw: unknown): ProviderRowInput[] {
   if (!Array.isArray(raw)) return fail(400, "body must be an array");
+  if (raw.length > PROVIDER_NAMES.length) return fail(400, "too many provider entries");
+  const seen = new Set<string>();
   return raw.map((item, index) => {
     if (!item || typeof item !== "object") return fail(400, `[${index}]: must be an object`);
     const obj = item as Record<string, unknown>;
@@ -31,12 +35,14 @@ function parseProviderRows(raw: unknown): ProviderRowInput[] {
     if (typeof provider !== "string" || !PROVIDER_NAME_SET.includes(provider)) {
       return fail(400, `[${index}]: "provider" must be one of ${PROVIDER_NAMES.join(", ")}`);
     }
+    if (seen.has(provider)) return fail(400, `[${index}]: duplicate provider`);
+    seen.add(provider);
 
     const enabled = obj.enabled;
     if (typeof enabled !== "boolean") return fail(400, `[${index}]: "enabled" must be a boolean`);
 
     const priority = obj.priority;
-    if (typeof priority !== "number" || !Number.isInteger(priority) || priority < 1) {
+    if (typeof priority !== "number" || !Number.isSafeInteger(priority) || priority < 1) {
       return fail(400, `[${index}]: "priority" must be an integer >= 1`);
     }
 
@@ -55,14 +61,7 @@ providersRoutes.put("/providers", async (c) => {
   const raw = await readJsonBody<unknown>(c);
   const rows = parseProviderRows(raw);
 
-  for (const row of rows) {
-    await upsertAppProvider(db, {
-      appId: c.var.app.id,
-      provider: row.provider,
-      enabled: row.enabled,
-      priority: row.priority,
-    });
-  }
+  await upsertAppProviders(db, rows.map((row) => ({ ...row, appId: c.var.app.id })));
   await invalidateAppConfig(c.env, c.var.app.id);
 
   const plan = await getAppProviderPlan(db, c.var.app.id);

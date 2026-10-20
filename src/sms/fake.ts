@@ -1,11 +1,6 @@
 import type { ISmsProvider, SmsDynamicMessage, SmsSendOutcome } from "../shared/types";
 import { maskPhone } from "./phone";
 
-const summarize = (message: string): string => {
-  const head = message.slice(0, 8);
-  return `"${head}${message.length > 8 ? "..." : ""}" (${message.length} chars)`;
-};
-
 /**
  * Accepts every recipient unconditionally — no network call. For local dev
  * and tests where a real gateway send is undesirable. Ported from acadion's
@@ -24,7 +19,7 @@ export class FakeSms implements ISmsProvider {
         op: "send",
         recipientCount: recipients.length,
         first: maskPhone(recipients[0]),
-        message: summarize(message),
+        messageLength: message.length,
       }),
     );
     return recipients.map(() => ({ accepted: true, trackingId: crypto.randomUUID() }));
@@ -39,7 +34,7 @@ export class FakeSms implements ISmsProvider {
         op: "sendDynamic",
         recipientCount: messages.length,
         first: maskPhone(first?.to),
-        message: summarize(first?.message ?? ""),
+        messageLength: first?.message.length ?? 0,
       }),
     );
     return messages.map(() => ({ accepted: true, trackingId: crypto.randomUUID() }));

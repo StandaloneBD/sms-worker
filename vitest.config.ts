@@ -1,4 +1,4 @@
-import { cloudflareTest } from "@cloudflare/vitest-plugin";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
 // Workers-runtime test harness: tests in test/**/*.test.ts run inside
@@ -9,9 +9,14 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
-      // wrangler.jsonc `vars` only carries FAKE_SMS, and the plugin never
-      // reads .dev.vars — encryptSecret needs ENCRYPTION_KEY in every test.
-      miniflare: { bindings: { ENCRYPTION_KEY: "test-encryption-key" } },
+      // Explicit test values take precedence over local .dev.vars.
+      miniflare: { bindings: {
+        ENCRYPTION_KEY: "test-encryption-key",
+        SESSION_SECRET: "test-session-secret",
+        ADMIN_BOOTSTRAP_PASSWORD: "test-bootstrap-password",
+        FAKE_SMS: "true",
+        TEST_MIGRATIONS: await readD1Migrations("./drizzle"),
+      } },
     }),
   ],
   test: {

@@ -54,8 +54,15 @@ function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
   }
 }
 
-export function timingSafeEqualStr(a: string, b: string): boolean {
-  return timingSafeEqualBytes(new TextEncoder().encode(a), new TextEncoder().encode(b));
+/** Compares SHA-256 digests, so neither the content nor the length of the
+ *  secret side leaks through timing. */
+export async function timingSafeEqualStr(a: string, b: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [aHash, bHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(a)),
+    crypto.subtle.digest("SHA-256", encoder.encode(b)),
+  ]);
+  return crypto.subtle.timingSafeEqual(aHash, bHash);
 }
 
 /* ------------------------------------------------------------------ */
@@ -240,7 +247,9 @@ export async function verifySession(env: Env, token: string): Promise<SessionCla
   const adminId = Number(adminIdStr);
   const version = Number(versionStr);
   const exp = Number(expStr);
-  if (!Number.isInteger(adminId) || !Number.isInteger(version) || !Number.isFinite(exp)) return null;
+  if (!Number.isSafeInteger(adminId) || adminId <= 0 || !Number.isSafeInteger(version) || !Number.isSafeInteger(exp)) {
+    return null;
+  }
   if (Math.floor(Date.now() / 1000) >= exp) return null;
 
   const key = await getHmacKey(env);
@@ -251,5 +260,5 @@ export async function verifySession(env: Env, token: string): Promise<SessionCla
   );
   const expected = toBase64Url(new Uint8Array(expectedSig));
 
-  return timingSafeEqualStr(sig, expected) ? { adminId, version } : null;
+  return (await timingSafeEqualStr(sig, expected)) ? { adminId, version } : null;
 }

@@ -30,14 +30,13 @@ import {
 import { dispatch, toDispatchInput } from "../sms/dispatch";
 import { resolveBody } from "../sms/template";
 import {
+  MAX_REASON_LENGTH,
   RETRY_BASE_SECONDS,
   RETRY_MAX_SECONDS,
   SEND_RETRY_BASE_SECONDS,
   SEND_ROUNDS,
 } from "../shared/constants";
 import type { ChunkPayload, ChunkQueueMessage, DispatchResultItem } from "../shared/types";
-
-const MAX_REASON_LENGTH = 500;
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -118,8 +117,10 @@ interface RoundTarget {
   to: string;
   /** Undefined when no body resolves (immediate failure, never dispatched). */
   body: string | undefined;
-  /** true only when the body came from an explicit recipient.message override. */
-  isExplicitOverride: boolean;
+  /** Whether the history row keeps the body: an explicit recipient.message
+   *  override, or a template render (vars aren't stored, so the row is the
+   *  only record of the text). A plain request-level message is on the job. */
+  storeBody: boolean;
 }
 
 /** Chunk-relative indexes still to send: all of them in round 0, the
@@ -143,7 +144,7 @@ function resolveTargets(payload: ChunkPayload, indexes: readonly number[]): Roun
       index,
       to: recipient.to,
       body: resolveBody(recipient, payload) || undefined,
-      isExplicitOverride: recipient.message !== undefined,
+      storeBody: recipient.message !== undefined || payload.templateBody !== undefined,
     });
   }
   return targets;
@@ -177,7 +178,7 @@ function settleRound(
     jobId,
     appId,
     recipient: target.to,
-    body: target.isExplicitOverride ? (target.body ?? null) : null,
+    body: target.storeBody ? (target.body ?? null) : null,
     provider: null,
     status: "failed",
     reason: truncateReason(reason),
@@ -218,7 +219,7 @@ function settleRound(
       jobId,
       appId,
       recipient: target.to,
-      body: target.isExplicitOverride ? target.body : null,
+      body: target.storeBody ? target.body : null,
       provider: outcome.provider,
       status: outcome.accepted ? "sent" : "failed",
       reason: outcome.reason ? truncateReason(outcome.reason) : null,

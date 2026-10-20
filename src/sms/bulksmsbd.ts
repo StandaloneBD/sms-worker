@@ -4,7 +4,8 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
-import { ProviderTransportError, failureForStatus, failureOf } from "./errors";
+import { failureOf } from "./errors";
+import { postProviderJson } from "./http";
 
 const SMS_URL = "https://bulksmsbd.net/api/smsapi";
 const SMS_MANY_URL = "https://bulksmsbd.net/api/smsapimany";
@@ -30,12 +31,8 @@ const MAX_TIMEOUT_MS = 30_000;
 const timeoutFor = (recipientCount: number): number =>
   Math.min(MAX_TIMEOUT_MS, BASE_TIMEOUT_MS + recipientCount * 25);
 
-function isAbortError(err: unknown): boolean {
-  return typeof err === "object" && err !== null && "name" in err && err.name === "AbortError";
-}
-
 type BulkSmsBdResponse = {
-  response_code?: number;
+  response_code?: number | string;
   error_message?: string;
   message_id?: string;
 };
@@ -165,42 +162,13 @@ export class BulkSmsBd implements ISmsProvider {
   ): Promise<SmsSendOutcome> {
     console.log(JSON.stringify({ provider: "bulksmsbd", event: "sending", ...metadata }));
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": contentType },
-        body: requestBody,
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if (isAbortError(err)) {
-        throw new ProviderTransportError("BulkSmsBd request timed out");
-      }
-      throw new ProviderTransportError(
-        `BulkSmsBd request failed: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err },
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (!response.ok) {
-      throw new ProviderTransportError(`SMS request failed with status ${response.status}`, {
-        failure: failureForStatus(response.status),
-      });
-    }
-
-    let body: BulkSmsBdResponse;
-    try {
-      body = (await response.json()) as BulkSmsBdResponse;
-    } catch (err) {
-      throw new ProviderTransportError(
-        `SMS response body could not be parsed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    const raw = await postProviderJson("BulkSmsBd", url, requestBody, { "Content-Type": contentType }, timeoutMs);
+    const body: BulkSmsBdResponse = {
+      response_code:
+        typeof raw.response_code === "number" || typeof raw.response_code === "string" ? raw.response_code : undefined,
+      error_message: typeof raw.error_message === "string" ? raw.error_message : undefined,
+      message_id: typeof raw.message_id === "string" ? raw.message_id : undefined,
+    };
 
     const responseCode = Number(body.response_code);
     if (responseCode === ACCEPTED_CODE) {

@@ -181,7 +181,16 @@ export async function buildDispatchPlan(
         entries.push({ provider: new MimSms({ apiKey, username, senderName }) });
       }
     } catch (err) {
-      warnings.push(`${item.provider} omitted: ${err instanceof Error ? err.message : String(err)}`);
+      // Details go to the log only: warnings reach API clients.
+      console.error(
+        JSON.stringify({
+          event: "provider_credentials_invalid",
+          provider: item.provider,
+          appId,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      warnings.push(`${item.provider} omitted: credentials could not be loaded`);
     }
   }
 

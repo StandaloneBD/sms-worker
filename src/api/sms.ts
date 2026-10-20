@@ -9,7 +9,6 @@
  */
 
 import { Hono, type Context } from "hono";
-import { bodyLimit } from "hono/body-limit";
 import {
   getDb,
   getJobForApp,
@@ -32,6 +31,7 @@ import {
   MAX_BODY_BYTES,
   MAX_JOB_RECIPIENTS,
   MAX_MESSAGE_LENGTH,
+  MAX_REASON_LENGTH,
   MAX_SYNC_BODY_BYTES,
   MAX_SYNC_RECIPIENTS,
 } from "../shared/constants";
@@ -42,6 +42,7 @@ import type {
   JobPayloadHeader,
   JobRecipient,
 } from "../shared/types";
+import { requestBodyLimit } from "../shared/body-limit";
 import { idempotency } from "./idempotency";
 import { chargeDailyQuota, sendRateLimit } from "./limits";
 import {
@@ -58,12 +59,8 @@ export const smsRoutes = new Hono<AppEnv>();
 
 /** Cloudflare Queues hard cap on messages per sendBatch() call. */
 const QUEUE_SEND_BATCH_LIMIT = 100;
-const REASON_MAX_LENGTH = 500;
-
-/** Shared 413 handler for both body-limit middlewares below — matches the
- *  API's normal error envelope via `fail()` + the apiRoutes-level onError
- *  (see api/index.ts) rather than hono/body-limit's plain-text default. */
-const rejectOversizedBody = () => fail(413, "request body too large");
+/** Masking profile labels are 1-32 characters (Admin → Apps). */
+const MAX_MASKING_LABEL_LENGTH = 32;
 
 interface SendFields {
   message?: string;
@@ -82,14 +79,23 @@ function parseSendFields(raw: unknown): SendFields {
   if (obj.message !== undefined && typeof obj.message !== "string") {
     fail(400, `"message" must be a string`);
   }
+  if (typeof obj.message === "string" && obj.message.length > MAX_MESSAGE_LENGTH) {
+    fail(400, `"message" exceeds ${MAX_MESSAGE_LENGTH} characters`);
+  }
   if (
     obj.templateId !== undefined &&
-    (typeof obj.templateId !== "number" || !Number.isInteger(obj.templateId))
+    (typeof obj.templateId !== "number" || !Number.isSafeInteger(obj.templateId) || obj.templateId <= 0)
   ) {
-    fail(400, `"templateId" must be an integer`);
+    fail(400, `"templateId" must be a positive integer`);
   }
   if (obj.maskingProfile !== undefined && typeof obj.maskingProfile !== "string") {
     fail(400, `"maskingProfile" must be a string`);
+  }
+  if (
+    typeof obj.maskingProfile === "string" &&
+    (obj.maskingProfile.length < 1 || obj.maskingProfile.length > MAX_MASKING_LABEL_LENGTH)
+  ) {
+    fail(400, `"maskingProfile" must be 1-${MAX_MASKING_LABEL_LENGTH} characters`);
   }
   if (obj.maskingStrict !== undefined && typeof obj.maskingStrict !== "boolean") {
     fail(400, `"maskingStrict" must be a boolean`);
@@ -134,7 +140,7 @@ function bodyProblem(body: string | undefined): string | null {
 smsRoutes.post(
   "/sms/send",
   sendRateLimit,
-  bodyLimit({ maxSize: MAX_SYNC_BODY_BYTES, onError: rejectOversizedBody }),
+  requestBodyLimit(MAX_SYNC_BODY_BYTES),
   idempotency,
   async (c) => {
     const db = getDb(c.env);
@@ -221,10 +227,12 @@ smsRoutes.post(
               jobId: id,
               appId: app.id,
               recipient: recipient.to,
-              body: recipient.message !== undefined ? recipient.message : null,
+              // The rendered text for template sends too: vars aren't stored,
+              // so the history row is the only record of what went out.
+              body: templateBody !== undefined || recipient.message !== undefined ? (bodies[index] ?? null) : null,
               provider: result.provider ?? null,
               status: result.accepted ? "sent" : "failed",
-              reason: result.reason ? truncate(result.reason, REASON_MAX_LENGTH) : null,
+              reason: result.reason ? truncate(result.reason, MAX_REASON_LENGTH) : null,
               trackingId: result.trackingId ?? null,
             };
           });
@@ -253,7 +261,7 @@ smsRoutes.post(
 smsRoutes.post(
   "/sms/jobs",
   sendRateLimit,
-  bodyLimit({ maxSize: MAX_BODY_BYTES, onError: rejectOversizedBody }),
+  requestBodyLimit(MAX_BODY_BYTES),
   idempotency,
   async (c) => {
     const db = getDb(c.env);

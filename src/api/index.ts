@@ -16,6 +16,12 @@ import type { AppEnv } from "../shared/types";
 
 export const apiRoutes = new Hono<AppEnv>();
 
+apiRoutes.use("*", async (c, next) => {
+  c.header("Cache-Control", "no-store");
+  c.header("X-Content-Type-Options", "nosniff");
+  await next();
+});
+
 apiRoutes.use("*", authMiddleware);
 
 apiRoutes.route("/", smsRoutes);

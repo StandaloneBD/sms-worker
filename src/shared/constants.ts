@@ -41,6 +41,9 @@ export const MAX_BODY_BYTES = 25 * 1024 * 1024;
 /** Message body length cap (matches acadion's contract). */
 export const MAX_MESSAGE_LENGTH = 1000;
 
+/** Cap on a stored/returned failure reason. */
+export const MAX_REASON_LENGTH = 500;
+
 /** Template name length cap. */
 export const MAX_TEMPLATE_NAME_LENGTH = 64;
 
@@ -133,3 +136,5 @@ export const r2LegacyJobKey = (jobId: string) => `jobs/${jobId}.json`;
 /** Session cookie name for the admin UI. */
 export const SESSION_COOKIE = "sms_admin_session";
 export const SESSION_TTL_SECONDS = 12 * 60 * 60;
+/** Upper bound on admin password input (PBKDF2 cost grows with it). */
+export const MAX_PASSWORD_LENGTH = 1024;

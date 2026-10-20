@@ -32,7 +32,17 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
 
   let cached: AuthedApp | null = null;
   try {
-    cached = await c.env.CACHE.get<AuthedApp>(cacheKey, "json");
+    const value = await c.env.CACHE.get<AuthedApp>(cacheKey, "json");
+    // Only trust a cache entry with the expected shape.
+    if (
+      value &&
+      Number.isSafeInteger(value.id) &&
+      value.id > 0 &&
+      typeof value.name === "string" &&
+      typeof value.isActive === "boolean"
+    ) {
+      cached = value;
+    }
   } catch (err) {
     // KV failures are swallowed — D1 is queried regardless, below.
     console.warn(

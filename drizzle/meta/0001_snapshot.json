@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "a2c9d146-299d-4b2c-929a-eaf9a9f2036b",
+  "id": "f3e8bb98-3033-42f3-9638-4f37d378a004",
   "prevId": "78b57614-ef6c-41d0-a680-28fe0c6832f2",
   "tables": {
     "admins": {
@@ -27,14 +27,6 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
-        },
-        "session_version": {
-          "name": "session_version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
         },
         "created_at": {
           "name": "created_at",
@@ -112,46 +104,6 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "app_usage": {
-      "name": "app_usage",
-      "columns": {
-        "app_id": {
-          "name": "app_id",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "day": {
-          "name": "day",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "recipients": {
-          "name": "recipients",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "app_usage_app_id_day_pk": {
-          "columns": [
-            "app_id",
-            "day"
-          ],
-          "name": "app_usage_app_id_day_pk"
-        }
-      },
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
     "apps": {
       "name": "apps",
       "columns": {
@@ -191,13 +143,6 @@
           "autoincrement": false,
           "default": true
         },
-        "daily_quota": {
-          "name": "daily_quota",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "created_at": {
           "name": "created_at",
           "type": "integer",
@@ -224,81 +169,6 @@
       },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "idempotency_keys": {
-      "name": "idempotency_keys",
-      "columns": {
-        "app_id": {
-          "name": "app_id",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "key": {
-          "name": "key",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "request_hash": {
-          "name": "request_hash",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "response_status": {
-          "name": "response_status",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "response_body": {
-          "name": "response_body",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "locked_at": {
-          "name": "locked_at",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idempotency_keys_created_idx": {
-          "name": "idempotency_keys_created_idx",
-          "columns": [
-            "created_at"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "idempotency_keys_app_id_key_pk": {
-          "columns": [
-            "app_id",
-            "key"
-          ],
-          "name": "idempotency_keys_app_id_key_pk"
-        }
-      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
@@ -349,78 +219,9 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
-        },
-        "total": {
-          "name": "total",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "round": {
-          "name": "round",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "retry_indexes": {
-          "name": "retry_indexes",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "payload_offset": {
-          "name": "payload_offset",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "payload_length": {
-          "name": "payload_length",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "claim_token": {
-          "name": "claim_token",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
-        },
-        "requeues": {
-          "name": "requeues",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 0
         }
       },
-      "indexes": {
-        "job_chunks_status_updated_idx": {
-          "name": "job_chunks_status_updated_idx",
-          "columns": [
-            "status",
-            "updated_at"
-          ],
-          "isUnique": false
-        }
-      },
+      "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {
         "job_chunks_job_id_chunk_index_pk": {
@@ -548,30 +349,7 @@
           "autoincrement": false
         }
       },
-      "indexes": {
-        "jobs_app_created_idx": {
-          "name": "jobs_app_created_idx",
-          "columns": [
-            "app_id",
-            "created_at"
-          ],
-          "isUnique": false
-        },
-        "jobs_created_idx": {
-          "name": "jobs_created_idx",
-          "columns": [
-            "created_at"
-          ],
-          "isUnique": false
-        },
-        "jobs_status_idx": {
-          "name": "jobs_status_idx",
-          "columns": [
-            "status"
-          ],
-          "isUnique": false
-        }
-      },
+      "indexes": {},
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},

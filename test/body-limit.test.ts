@@ -99,19 +99,11 @@ describe("body-limit middleware", () => {
     expect(body.error).toMatch(/recipients/);
   });
 
-  it("/sms/jobs: a spoofed small Content-Length is trusted, not caught, by the byte-cap limiter", async () => {
-    // hono/body-limit's fast path trusts a present Content-Length header
-    // (no transfer-encoding) at face value and never streams to verify it —
-    // see node_modules/hono/dist/middleware/body-limit/index.js. So a
-    // dishonest small Content-Length passes the limiter untouched; here it
-    // then fails downstream instead, as malformed JSON (the filler payload
-    // isn't valid JSON), confirming the limiter did not intervene. This is
-    // not a regression: the old manual `Content-Length` pre-check trusted
-    // the same header the same way.
+  it("/sms/send: a spoofed small Content-Length cannot bypass actual byte counting", async () => {
     const app = buildApp();
-    const actualBody = "a".repeat(5000);
+    const actualBody = "a".repeat(MAX_SYNC_BODY_BYTES + 1);
     const res = await app.request(
-      "/sms/jobs",
+      "/sms/send",
       {
         method: "POST",
         headers: { "content-type": "application/json", "content-length": "10" },
@@ -119,9 +111,9 @@ describe("body-limit middleware", () => {
       },
       env,
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(413);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("malformed JSON body");
+    expect(body.error).toBe("request body too large");
   });
 
   it("/sms/send: a normal body reaches the handler and gets a 400 from validation, not a 413", async () => {
@@ -154,7 +146,7 @@ describe("MAX_MESSAGE_LENGTH is enforced before dispatch, well under the byte ca
     );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
-    expect(body.error).toBe(`recipients[0]: body exceeds ${MAX_MESSAGE_LENGTH} characters`);
+    expect(body.error).toBe(`"message" exceeds ${MAX_MESSAGE_LENGTH} characters`);
   });
 
   it("/sms/jobs: a per-recipient body over MAX_MESSAGE_LENGTH is a 400, never enqueued", async () => {
@@ -171,7 +163,6 @@ describe("MAX_MESSAGE_LENGTH is enforced before dispatch, well under the byte ca
     );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string; indexes: number[] };
-    expect(body.error).toBe("invalid recipients");
-    expect(body.indexes).toEqual([0]);
+    expect(body.error).toBe(`"message" exceeds ${MAX_MESSAGE_LENGTH} characters`);
   });
 });

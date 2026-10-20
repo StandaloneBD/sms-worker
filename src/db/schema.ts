@@ -114,8 +114,9 @@ export const jobs = sqliteTable(
     completedAt: int("completed_at"),
   },
   (t) => [
-    index("jobs_app_created_idx").on(t.appId, t.createdAt),
-    index("jobs_created_idx").on(t.createdAt),
+    // id breaks created_at ties so paginated listings are stable.
+    index("jobs_app_created_idx").on(t.appId, t.createdAt, t.id),
+    index("jobs_created_idx").on(t.createdAt, t.id),
     index("jobs_status_idx").on(t.status),
   ],
 );

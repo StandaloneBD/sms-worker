@@ -6,7 +6,8 @@
  */
 
 import type { Context } from "hono";
-import { getDb } from "../../db";
+import { getDb, isUniqueConstraintError } from "../../db";
+import { MAX_PASSWORD_LENGTH } from "../../shared/constants";
 import { countAdmins, createAdmin, getAdminByUsername } from "../../db/queries";
 import { hashPassword, timingSafeEqualStr, verifyPassword } from "../../shared/crypto";
 import type { AppEnv } from "../../shared/types";
@@ -73,6 +74,10 @@ export async function loginPost(c: Context<AppEnv>): Promise<Response> {
     return redirectFlash(c, adminPath("/login"), "Username and password are required.", "error");
   }
 
+  if (username.length > 64 || password.length > MAX_PASSWORD_LENGTH) {
+    return redirectFlash(c, adminPath("/login"), INVALID_CREDENTIALS, "error");
+  }
+
   if (!(await loginAllowed(c))) {
     return redirectFlash(c, adminPath("/login"), TOO_MANY_ATTEMPTS, "error");
   }
@@ -85,12 +90,22 @@ export async function loginPost(c: Context<AppEnv>): Promise<Response> {
     if (
       username !== BOOTSTRAP_USERNAME ||
       !bootstrapPassword ||
-      !timingSafeEqualStr(password, bootstrapPassword)
+      !(await timingSafeEqualStr(password, bootstrapPassword))
     ) {
       return redirectFlash(c, adminPath("/login"), INVALID_CREDENTIALS, "error");
     }
     const passwordHash = await hashPassword(password);
-    const admin = await createAdmin(db, { username: BOOTSTRAP_USERNAME, passwordHash });
+    let admin;
+    try {
+      admin = await createAdmin(db, { username: BOOTSTRAP_USERNAME, passwordHash });
+    } catch (err) {
+      if (!isUniqueConstraintError(err)) throw err;
+      // Another first login may have won the insert while PBKDF2 ran.
+      admin = await getAdminByUsername(db, BOOTSTRAP_USERNAME);
+      if (!admin || !(await verifyPassword(password, admin.passwordHash))) {
+        return redirectFlash(c, adminPath("/login"), INVALID_CREDENTIALS, "error");
+      }
+    }
     await createSession(c, { adminId: admin.id, version: admin.sessionVersion });
     return c.redirect(adminPath("/"), 303);
   }

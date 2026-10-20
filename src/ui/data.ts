@@ -64,7 +64,14 @@ export async function getAppProviderRows(db: Db, appId: number): Promise<AppProv
     const globallyEnabled = global?.enabled ?? false;
     const override = overrideMap.get(provider);
     if (override) return { ...override, globallyEnabled };
-    return { provider, enabled: globallyEnabled, priority: global?.priority ?? 100, globallyEnabled };
+    // An App with any override rows uses those exclusively, so a provider
+    // without a row isn't in its plan.
+    return {
+      provider,
+      enabled: overrides.length === 0 && globallyEnabled,
+      priority: global?.priority ?? 100,
+      globallyEnabled,
+    };
   });
 }
 
