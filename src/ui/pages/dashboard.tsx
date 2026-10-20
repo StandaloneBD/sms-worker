@@ -1,106 +1,121 @@
-/** GET / — recent jobs + quick links into the rest of the admin UI. */
+/** GET / — delivery across every App, and each App's share of it. Jobs and
+ *  messages live under their App (see ./app-overview, ./jobs, ./messages). */
 
 import type { Context } from "hono";
 import { getDb } from "../../db";
-import { listJobs } from "../../db/queries";
+import { listApps } from "../../db/queries";
 import type { AppEnv } from "../../shared/types";
-import { ChunkProgress, Empty, PageHeader, Panel, Status } from "../components";
-import { appNameMap, dashboardStats } from "../data";
+import { failureRate, formatRate, Spark, StatTile, VolumeChart } from "../charts";
+import { Empty, PageHeader, Panel } from "../components";
+import { CHART_DAYS, dailyVolume, deliveryStats } from "../data";
+import type { DailySeries } from "../data";
 import { readFlash } from "../flash";
 import { Layout } from "../layout";
-import { adminPath } from "../paths";
-import { formatNum, formatTs, shortId } from "../util";
+import { adminPath, appPath } from "../paths";
+import { formatNum } from "../util";
 
-const RECENT_JOBS_LIMIT = 10;
+/** The apps table totals the most recent week of the chart's days. */
+const WEEK = 7;
+
+const lastWeek = (values: number[]) => values.slice(-WEEK).reduce((a, b) => a + b, 0);
 
 export async function dashboardGet(c: Context<AppEnv>): Promise<Response> {
   const db = getDb(c.env);
-  const [jobs, appNames, stats] = await Promise.all([
-    listJobs(db, { limit: RECENT_JOBS_LIMIT, offset: 0 }),
-    appNameMap(db),
-    dashboardStats(db),
-  ]);
+  const [apps, stats, volume] = await Promise.all([listApps(db), deliveryStats(db), dailyVolume(db)]);
   const flash = readFlash(c);
 
   const totalToday = stats.sent24h + stats.failed24h;
-  const failedPct = totalToday > 0 ? Math.round((stats.failed24h / totalToday) * 100) : 0;
+  const activeApps = apps.filter((app) => app.isActive).length;
+  const none: DailySeries = { sent: volume.days.map(() => 0), failed: volume.days.map(() => 0) };
+
+  const rows = apps
+    .map((app) => {
+      const series = volume.byApp.get(app.id) ?? none;
+      return {
+        app,
+        series,
+        sent: lastWeek(series.sent),
+        failed: lastWeek(series.failed),
+        inFlight: stats.inFlightByApp.get(app.id) ?? { running: 0, queued: 0 },
+      };
+    })
+    // Busiest first; idle apps keep their alphabetical order (listApps).
+    .sort((a, b) => b.sent + b.failed - (a.sent + a.failed));
 
   return c.html(
     <Layout title="Overview" active="dashboard" flash={flash}>
-      <PageHeader eyebrow="OVERVIEW" title="Delivery" />
+      <PageHeader title="Overview" sub="Delivery across every app. Days are UTC." />
 
       <div class="stat-row">
-        <div class="stat">
-          <p class="stat-label">Sent (24h)</p>
-          <p class="stat-value">{formatNum(stats.sent24h)}</p>
+        <StatTile label="Sent, last 24h" value={formatNum(stats.sent24h)}>
           <div class="ratio">
             <span style={`flex:${stats.sent24h}`} />
             <span style={`flex:${stats.failed24h}`} />
           </div>
-        </div>
-        <div class="stat">
-          <p class="stat-label">Failed (24h)</p>
-          <p class="stat-value">{formatNum(stats.failed24h)}</p>
-          <p class="stat-sub">{failedPct}% of total</p>
-        </div>
-        <div class="stat">
-          <p class="stat-label">Jobs</p>
-          <p class="stat-value">
-            {formatNum(stats.jobsRunning)} / {formatNum(stats.jobsQueued)}
-          </p>
-          <p class="stat-sub">running / queued</p>
-        </div>
-        <div class="stat">
-          <p class="stat-label">Active apps</p>
-          <p class="stat-value">{formatNum(stats.activeApps)}</p>
-        </div>
+        </StatTile>
+        <StatTile
+          label="Failed, last 24h"
+          value={formatNum(stats.failed24h)}
+          sub={totalToday > 0 ? `${formatRate(failureRate(stats.sent24h, stats.failed24h))} of recipients` : "No recipients yet"}
+        />
+        <StatTile
+          label="Jobs in progress"
+          value={formatNum(stats.inFlight.running + stats.inFlight.queued)}
+          sub={`${formatNum(stats.inFlight.running)} running, ${formatNum(stats.inFlight.queued)} queued`}
+        />
+        <StatTile label="Active apps" value={formatNum(activeApps)} sub={`of ${formatNum(apps.length)} registered`} />
       </div>
 
+      <Panel title={`Recipients per day, last ${CHART_DAYS} days`}>
+        <VolumeChart days={volume.days} series={volume.total} caption="Recipients per day across every app" />
+      </Panel>
+
       <Panel
-        title="Recent jobs"
+        title="Apps"
         flush
         actions={
-          <a class="btn btn-quiet btn-sm" href={adminPath("/jobs")}>
-            All jobs →
+          <a class="btn btn-quiet btn-sm" href={adminPath("/apps")}>
+            Manage apps
           </a>
         }
       >
-        {jobs.length === 0 ? (
-          <Empty title="No jobs yet." hint="POST /v1/sms/jobs" />
+        {rows.length === 0 ? (
+          <Empty title="No apps yet. Register one to get an API key." />
         ) : (
           <div class="table-wrap">
-            <table class="data">
+            <table class="data app-table">
               <thead>
                 <tr>
-                  <th>Job</th>
                   <th>App</th>
-                  <th>Kind</th>
-                  <th>Status</th>
-                  <th>Progress</th>
-                  <th class="num">Sent</th>
-                  <th class="num">Failed</th>
-                  <th>Created</th>
+                  <th>Last {CHART_DAYS} days</th>
+                  <th class="num">Sent, 7 days</th>
+                  <th class="num">Failed, 7 days</th>
+                  <th class="num">Failure rate</th>
+                  <th class="num">Jobs in progress</th>
                 </tr>
               </thead>
               <tbody>
-                {jobs.map((job) => (
+                {rows.map(({ app, series, sent, failed, inFlight }) => (
                   <tr>
                     <td>
-                      <a class="mono row-link" href={adminPath(`/jobs/${job.id}`)} title={job.id}>
-                        {shortId(job.id)}…
+                      <a class="app-link" href={appPath(app.id)}>
+                        {app.name}
                       </a>
-                    </td>
-                    <td>{appNames.get(job.appId) ?? `#${job.appId}`}</td>
-                    <td>{job.kind}</td>
-                    <td>
-                      <Status value={job.status} />
+                      {app.isActive ? null : <span class="badge badge-off badge-inline">Inactive</span>}
                     </td>
                     <td>
-                      <ChunkProgress done={job.chunksDone} total={job.chunkCount} />
+                      <Spark days={volume.days} series={series} label={`${app.name}, recipients per day`} />
                     </td>
-                    <td class="num">{formatNum(job.sent)}</td>
-                    <td class="num">{formatNum(job.failed)}</td>
-                    <td class="mono">{formatTs(job.createdAt)}</td>
+                    <td class="num">{formatNum(sent)}</td>
+                    <td class="num">{formatNum(failed)}</td>
+                    <td class="num">{formatRate(failureRate(sent, failed))}</td>
+                    <td class="num">
+                      {inFlight.running + inFlight.queued === 0 ? (
+                        <span class="muted">—</span>
+                      ) : (
+                        formatNum(inFlight.running + inFlight.queued)
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

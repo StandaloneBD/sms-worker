@@ -391,8 +391,15 @@ smsRoutes.get("/sms/jobs/:id/messages", async (c) => {
   const job = await getJobForApp(db, c.var.app.id, id);
   if (!job) return fail(404, "job not found");
 
+  // `before` is the preferred way to page: pass the previous page's
+  // `nextBefore` and each page costs `limit` index rows, where `offset`
+  // (kept for older clients, and ignored alongside `before`) costs
+  // offset + limit. 0 stands for "absent": a real cursor is clamped to ≥ 1.
   const limit = parseQueryInt(c.req.query("limit"), { default: 50, min: 1, max: 200 });
-  const offset = parseQueryInt(c.req.query("offset"), { default: 0, min: 0 });
-  const messages = await listMessagesByJob(db, id, { limit, offset });
-  return c.json({ jobId: id, limit, offset, messages }, 200);
+  const cursor = parseQueryInt(c.req.query("before"), { default: 0, min: 1 });
+  const before = cursor > 0 ? cursor : null;
+  const offset = before === null ? parseQueryInt(c.req.query("offset"), { default: 0, min: 0 }) : 0;
+  const messages = await listMessagesByJob(db, id, { limit, offset, before: before ?? undefined });
+  const nextBefore = messages.length === limit ? (messages[messages.length - 1]?.id ?? null) : null;
+  return c.json({ jobId: id, limit, offset, before, nextBefore, messages }, 200);
 });

@@ -4,7 +4,7 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
-import { failureOf } from "./errors";
+import { detailOf, failureOf } from "./errors";
 import { postProviderJson } from "./http";
 
 const ONE_TO_MANY_URL = "https://api.mimsms.com/api/V2/OneToMany";
@@ -199,6 +199,7 @@ export class MimSms implements ISmsProvider {
             event: "batch_transport_failure",
             recipientCount: numbers.length,
             reason,
+            detail: detailOf(err),
           }),
         );
         const failure = failureOf(err);
@@ -281,14 +282,15 @@ export class MimSms implements ISmsProvider {
 
     if (errorEntries.length > 0) {
       // The element shape is undocumented, so log which keys came back — a real
-      // rejection teaches us the schema without putting recipient numbers or
-      // message bodies in the log.
+      // rejection teaches us the schema — plus the distinct reasons, without
+      // putting recipient numbers or message bodies in the log.
       console.warn(
         JSON.stringify({
           provider: "mimsms",
           event: "per_recipient_errors",
           count: errorEntries.length,
           unreadable: unreadableErrors,
+          reasons: Array.from(new Set(errorReasons.values())).slice(0, 10),
           keys: Array.from(
             new Set(
               errorEntries.flatMap((entry) =>

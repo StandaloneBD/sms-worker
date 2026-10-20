@@ -4,7 +4,7 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
-import { failureOf } from "./errors";
+import { detailOf, failureOf } from "./errors";
 import { postProviderJson } from "./http";
 
 const SMS_URL = "https://bulksmsbd.net/api/smsapi";
@@ -133,6 +133,7 @@ export class BulkSmsBd implements ISmsProvider {
             event: "batch_transport_failure",
             recipientCount: chunk.length,
             reason,
+            detail: detailOf(err),
           }),
         );
         outcome = { accepted: false, reason, failure: failureOf(err) };
@@ -189,6 +190,8 @@ export class BulkSmsBd implements ISmsProvider {
         event: "declined",
         responseCode: body.response_code,
         reason,
+        // A reason in a field we don't model would otherwise leave no trace.
+        bodyKeys: Object.keys(raw),
         ...metadata,
       }),
     );

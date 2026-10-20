@@ -7,6 +7,7 @@ import type {
   SmsSendOutcome,
 } from "../shared/types";
 import { MAX_REASON_LENGTH } from "../shared/constants";
+import { detailOf } from "./errors";
 import { orderByHealth, recordReachable, recordTransportFailure } from "./health";
 
 /**
@@ -58,6 +59,9 @@ export async function dispatch(
       results = await attempt(entry.provider, input, pending);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
+      console.error(
+        JSON.stringify({ provider: name, event: "provider_threw", recipientCount: pending.length, reason, detail: detailOf(err) }),
+      );
       for (const index of pending) {
         reasons[index]?.push(reason.slice(0, MAX_REASON_LENGTH));
         retryable[index] = true;

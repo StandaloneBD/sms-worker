@@ -1,7 +1,9 @@
 /**
- * GET/POST /apps (list + create) and the /apps/:id detail page: activate
- * toggle, key rotation, per-app provider plan editor, masking profiles, and
- * template create/delete (edit lives on its own page, see ./templates).
+ * GET/POST /apps (list + create) and an App's configuration page
+ * (/apps/:id/config): activate toggle, key rotation, daily quota, provider
+ * plan, masking profiles, and template create/delete (edit lives on its own
+ * page, see ./templates). Its overview, jobs and messages are ./app-overview,
+ * ./jobs and ./messages.
  */
 
 import type { Context } from "hono";
@@ -28,18 +30,23 @@ import { encryptSecret, generateApiKey } from "../../shared/crypto";
 import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH, usageDay } from "../../shared/constants";
 import { PROVIDER_NAMES } from "../../shared/types";
 import type { AppEnv, ProviderName } from "../../shared/types";
-import { Breadcrumb, Empty, Kv, NotFoundPage, PageHeader, Panel, Segments } from "../components";
+import { AppHeader, Empty, Kv, NotFoundPage, PageHeader, Panel, Segments } from "../components";
 import { getAppProviderRows } from "../data";
 import { redirectFlash, readFlash } from "../flash";
 import type { Flash } from "../flash";
 import { Layout } from "../layout";
-import { adminPath } from "../paths";
+import { adminPath, appPath } from "../paths";
+import {
+  EnabledSwitch,
+  PROVIDER_LABELS,
+  PriorityField,
+  ProviderOrderFoot,
+  ProviderOrderScript,
+  ProviderSlot,
+  ProviderTitle,
+  rankCounter,
+} from "../provider-order";
 import { formChecked, formatTs, formStr, parseId, parseIntOr, providerCredentialError } from "../util";
-
-const PROVIDER_LABELS: Record<ProviderName, string> = {
-  bulksmsbd: "BulkSMSBD",
-  mimsms: "MimSms",
-};
 
 function isProviderName(value: string): value is ProviderName {
   return (PROVIDER_NAMES as readonly string[]).includes(value);
@@ -90,7 +97,7 @@ export async function appsListGet(c: Context<AppEnv>): Promise<Response> {
                 {apps.map((app) => (
                   <tr>
                     <td>
-                      <a href={adminPath(`/apps/${app.id}`)}>{app.name}</a>
+                      <a class="app-link" href={appPath(app.id)}>{app.name}</a>
                     </td>
                     <td class="mono">{app.keyPrefix}</td>
                     <td>
@@ -144,15 +151,15 @@ export async function appsCreatePost(c: Context<AppEnv>): Promise<Response> {
   }
 
   return c.html(
-    <ApiKeyReveal appName={app.name} backHref={adminPath(`/apps/${app.id}`)} apiKey={generated.key} />,
+    <ApiKeyReveal appName={app.name} backHref={appPath(app.id)} apiKey={generated.key} />,
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* Detail                                                               */
+/* Configuration                                                               */
 /* ------------------------------------------------------------------ */
 
-export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
+export async function appConfigGet(c: Context<AppEnv>): Promise<Response> {
   const id = parseId(c.req.param("id"));
   if (id === null) {
     return c.html(<NotFoundPage flash={readFlash(c)} what="App" />, 404);
@@ -171,19 +178,31 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
     getAppUsage(db, id, usageDay()),
   ]);
   const flash = readFlash(c);
+  // Listed in priority order, which is the order this app's sends try them in.
+  const planRows = [...providerRows].sort((a, b) => a.priority - b.priority);
+  const nextRank = rankCounter();
 
   return c.html(
-    <Layout title={app.name} active="apps" flash={flash}>
-      <Breadcrumb items={[{ label: "Apps", href: adminPath("/apps") }, { label: app.name }]} />
-      <PageHeader
-        eyebrow="APP"
-        title={app.name}
+    <Layout title={`Configuration · ${app.name}`} active="apps" flash={flash}>
+      <AppHeader app={app} tab="config" />
+
+      <nav class="jump" aria-label="Configuration sections">
+        <a href="#access">Access</a>
+        <a href="#quota">Daily quota</a>
+        <a href="#providers">Provider plan</a>
+        <a href="#masking">Masking profiles</a>
+        <a href="#templates">Templates</a>
+      </nav>
+
+      <Panel
+        id="access"
+        title="Access"
         actions={
           <>
             <form method="post" action={adminPath(`/apps/${app.id}/active`)}>
               <input type="hidden" name="active" value={app.isActive ? "false" : "true"} />
-              <button type="submit" class="btn">
-                {app.isActive ? "Deactivate" : "Activate"}
+              <button type="submit" class="btn btn-sm">
+                {app.isActive ? "Deactivate app" : "Activate app"}
               </button>
             </form>
             <form
@@ -191,43 +210,29 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
               action={adminPath(`/apps/${app.id}/rotate-key`)}
               data-confirm="Rotate this app’s API key? The current key will stop working immediately."
             >
-              <button type="submit" class="btn btn-danger">
+              <button type="submit" class="btn btn-danger btn-sm">
                 Rotate key
               </button>
             </form>
           </>
         }
-      />
-
-      <Panel>
+      >
         <Kv
           items={[
             {
               label: "Status",
-              value: (
-                <span class={`badge ${app.isActive ? "badge-on" : "badge-off"}`}>
-                  {app.isActive ? "Active" : "Inactive"}
-                </span>
-              ),
+              value: app.isActive ? "Active: its API key is accepted" : "Inactive: its API key is refused (403)",
             },
             { label: "Key prefix", value: <span class="mono">{app.keyPrefix}</span> },
-            { label: "Created", value: <span class="mono">{formatTs(app.createdAt)}</span> },
-            {
-              label: "Recipients today (UTC)",
-              value: (
-                <span class="mono">
-                  {app.dailyQuota === null ? `${usedToday} · no quota` : `${usedToday} / ${app.dailyQuota}`}
-                </span>
-              ),
-            },
+            { label: "Registered", value: <span class="mono">{formatTs(app.createdAt)}</span> },
           ]}
         />
       </Panel>
 
-      <Panel title="Daily quota">
+      <Panel id="quota" title="Daily quota">
         <form method="post" action={adminPath(`/apps/${app.id}/quota`)}>
           <div class="field field-narrow">
-            <label for="daily-quota">Max recipients per UTC day</label>
+            <label for="daily-quota">Max recipients per UTC day ({usedToday} used today)</label>
             <input
               class="input"
               type="number"
@@ -250,56 +255,38 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
         </form>
       </Panel>
 
-      <Panel title="Provider plan" flush>
+      <Panel id="providers" title="Provider plan" flush>
         <form method="post" action={adminPath(`/apps/${app.id}/providers`)}>
-          <div class="table-wrap">
-            <table class="data">
-              <thead>
-                <tr>
-                  <th>Provider</th>
-                  <th>Enabled</th>
-                  <th>Priority</th>
-                </tr>
-              </thead>
-              <tbody>
-                {providerRows.map((row) => (
-                  <tr>
-                    <td>
-                      {PROVIDER_LABELS[row.provider]}
-                      {row.globallyEnabled ? null : <span class="muted"> · disabled globally</span>}
-                    </td>
-                    <td>
-                      <input
-                        class="check"
-                        type="checkbox"
-                        name={`${row.provider}_enabled`}
-                        value="on"
-                        checked={row.enabled}
-                      />
-                    </td>
-                    <td>
-                      <input
-                        class="input"
-                        type="number"
-                        name={`${row.provider}_priority`}
-                        value={String(row.priority)}
-                        style="width:90px"
-                      />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div class="panel-foot">
-            <button type="submit" class="btn btn-primary">
-              Save provider plan
-            </button>
-          </div>
+          <ol class="prov-list is-compact" data-prov-list>
+            {planRows.map((row) => {
+              const rank = nextRank(row.enabled && row.globallyEnabled);
+              return (
+                <li
+                  class="prov"
+                  data-prov={PROVIDER_LABELS[row.provider]}
+                  data-prov-off={row.globallyEnabled ? undefined : true}
+                >
+                  <ProviderSlot rank={rank} />
+                  <div class="prov-ident">
+                    <ProviderTitle provider={row.provider} rank={rank} globallyOff={!row.globallyEnabled} />
+                  </div>
+                  <div class="prov-controls">
+                    <EnabledSwitch provider={row.provider} checked={row.enabled} />
+                    <PriorityField provider={row.provider} priority={row.priority} />
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+          <ProviderOrderFoot
+            saveLabel="Save provider plan"
+            note={planRows[0]?.inherited ? "This app follows the global order until you save a plan here." : undefined}
+          />
         </form>
       </Panel>
+      <ProviderOrderScript />
 
-      <Panel title="Masking profiles" flush>
+      <Panel id="masking" title="Masking profiles" flush>
         {profiles.length === 0 ? (
           <Empty title="No masking profiles." hint="Add one below when a customer buys SMS masking." />
         ) : (
@@ -386,7 +373,7 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
         </div>
       </Panel>
 
-      <Panel title="Templates" flush>
+      <Panel id="templates" title="Templates" flush>
         {templates.length === 0 ? (
           <Empty title="No templates." hint="Add one below." />
         ) : (
@@ -394,6 +381,7 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
             <table class="data">
               <thead>
                 <tr>
+                  <th class="num" title="Pass this as templateId in the send API">ID</th>
                   <th>Name</th>
                   <th>Body</th>
                   <th>Updated</th>
@@ -403,6 +391,7 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
               <tbody>
                 {templates.map((tpl) => (
                   <tr>
+                    <td class="num mono">{tpl.id}</td>
                     <td>{tpl.name}</td>
                     <td class="cell-wrap">
                       <div class="mono">{tpl.body}</div>
@@ -490,7 +479,7 @@ export async function appQuotaPost(c: Context<AppEnv>): Promise<Response> {
   const raw = formStr(body.dailyQuota);
   const quota = raw === "" ? null : Number(raw);
   if (quota !== null && (!Number.isInteger(quota) || quota < 1)) {
-    return redirectFlash(c, adminPath(`/apps/${id}`), "Daily quota must be a whole number of at least 1.", "error");
+    return redirectFlash(c, appPath(id, "config"), "Daily quota must be a whole number of at least 1.", "error");
   }
   await setAppDailyQuota(db, id, quota);
   // Auth reads D1 first, so the next request already sees the new quota;
@@ -503,7 +492,7 @@ export async function appQuotaPost(c: Context<AppEnv>): Promise<Response> {
   });
   return redirectFlash(
     c,
-    adminPath(`/apps/${id}`),
+    appPath(id, "config"),
     quota === null ? "Daily quota removed." : `Daily quota set to ${quota} recipients.`,
   );
 }
@@ -528,7 +517,7 @@ export async function appActivePost(c: Context<AppEnv>): Promise<Response> {
   });
   return redirectFlash(
     c,
-    adminPath(`/apps/${id}`),
+    appPath(id, "config"),
     desired ? "App activated." : "App deactivated.",
   );
 }
@@ -550,7 +539,7 @@ export async function appRotateKeyPost(c: Context<AppEnv>): Promise<Response> {
   await invalidateAppAuthCache(c.env, app.keyHash);
 
   return c.html(
-    <ApiKeyReveal appName={app.name} backHref={adminPath(`/apps/${app.id}`)} apiKey={generated.key} />,
+    <ApiKeyReveal appName={app.name} backHref={appPath(app.id, "config")} apiKey={generated.key} />,
   );
 }
 
@@ -569,12 +558,12 @@ export async function appProvidersPost(c: Context<AppEnv>): Promise<Response> {
     priority: parseIntOr(formStr(body[`${provider}_priority`]), 0),
   }));
   if (inputs.some((row) => row.priority < 1)) {
-    return redirectFlash(c, adminPath(`/apps/${id}`), "Priority must be a positive integer.", "error");
+    return redirectFlash(c, appPath(id, "config"), "Priority must be a positive integer.", "error");
   }
   await upsertAppProviders(db, inputs);
   await invalidateAppConfig(c.env, id);
 
-  return redirectFlash(c, adminPath(`/apps/${id}`), "Provider plan saved.");
+  return redirectFlash(c, appPath(id, "config"), "Provider plan saved.");
 }
 
 export async function appMaskingCreatePost(c: Context<AppEnv>): Promise<Response> {
@@ -593,13 +582,13 @@ export async function appMaskingCreatePost(c: Context<AppEnv>): Promise<Response
   const apiKey = formStr(body.apiKey);
 
   if (!isProviderName(providerRaw)) {
-    return redirectFlash(c, adminPath(`/apps/${id}`), "Unknown provider.", "error");
+    return redirectFlash(c, appPath(id, "config"), "Unknown provider.", "error");
   }
   if (label.length < 1 || label.length > 32) {
-    return redirectFlash(c, adminPath(`/apps/${id}`), "Label must be 1-32 characters.", "error");
+    return redirectFlash(c, appPath(id, "config"), "Label must be 1-32 characters.", "error");
   }
   const credentialError = providerCredentialError({ apiKey, senderId, senderName, username });
-  if (credentialError) return redirectFlash(c, adminPath(`/apps/${id}`), credentialError, "error");
+  if (credentialError) return redirectFlash(c, appPath(id, "config"), credentialError, "error");
 
   const apiKeyEnc = apiKey ? await encryptSecret(c.env, apiKey) : null;
 
@@ -617,14 +606,14 @@ export async function appMaskingCreatePost(c: Context<AppEnv>): Promise<Response
     if (!isUniqueConstraintError(err)) throw err;
     return redirectFlash(
       c,
-      adminPath(`/apps/${id}`),
+      appPath(id, "config"),
       `A masking profile named "${label}" already exists for ${PROVIDER_LABELS[providerRaw]}.`,
       "error",
     );
   }
 
   await invalidateAppConfig(c.env, id);
-  return redirectFlash(c, adminPath(`/apps/${id}`), "Masking profile added.");
+  return redirectFlash(c, appPath(id, "config"), "Masking profile added.");
 }
 
 export async function appMaskingDeletePost(c: Context<AppEnv>): Promise<Response> {
@@ -642,7 +631,7 @@ export async function appMaskingDeletePost(c: Context<AppEnv>): Promise<Response
 
   return redirectFlash(
     c,
-    adminPath(`/apps/${id}`),
+    appPath(id, "config"),
     deleted ? "Masking profile deleted." : "Masking profile not found.",
     deleted ? "success" : "error",
   );
@@ -662,7 +651,7 @@ export async function appTemplateCreatePost(c: Context<AppEnv>): Promise<Respons
   if (name.length < 1 || name.length > MAX_TEMPLATE_NAME_LENGTH) {
     return redirectFlash(
       c,
-      adminPath(`/apps/${id}`),
+      appPath(id, "config"),
       `"name" must be 1-${MAX_TEMPLATE_NAME_LENGTH} characters`,
       "error",
     );
@@ -670,19 +659,20 @@ export async function appTemplateCreatePost(c: Context<AppEnv>): Promise<Respons
   if (tplBody.length < 1 || tplBody.length > MAX_MESSAGE_LENGTH) {
     return redirectFlash(
       c,
-      adminPath(`/apps/${id}`),
+      appPath(id, "config"),
       `"body" must be 1-${MAX_MESSAGE_LENGTH} characters`,
       "error",
     );
   }
 
+  let created;
   try {
-    await createTemplate(db, { appId: id, name, body: tplBody });
+    created = await createTemplate(db, { appId: id, name, body: tplBody });
   } catch (err) {
     if (isUniqueConstraintError(err)) {
       return redirectFlash(
         c,
-        adminPath(`/apps/${id}`),
+        appPath(id, "config"),
         `A template named "${name}" already exists.`,
         "error",
       );
@@ -693,7 +683,7 @@ export async function appTemplateCreatePost(c: Context<AppEnv>): Promise<Respons
   // No invalidateAppConfig here: templates aren't KV-cached (unlike masking
   // profiles / provider plan) — the send path fetches them from D1 by id on
   // every request, so there's nothing to invalidate.
-  return redirectFlash(c, adminPath(`/apps/${id}`), "Template added.");
+  return redirectFlash(c, appPath(id, "config"), `Template added. Send it with "templateId": ${created.id}.`);
 }
 
 export async function appTemplateDeletePost(c: Context<AppEnv>): Promise<Response> {
@@ -708,7 +698,7 @@ export async function appTemplateDeletePost(c: Context<AppEnv>): Promise<Respons
 
   return redirectFlash(
     c,
-    adminPath(`/apps/${id}`),
+    appPath(id, "config"),
     deleted
       ? `Template deleted. API calls still sending templateId=${templateId} will now get 404.`
       : "Template not found.",

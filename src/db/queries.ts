@@ -7,7 +7,7 @@
  * constants below.
  */
 
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import { HISTORY_INSERT_ROWS } from "../shared/constants";
@@ -591,28 +591,52 @@ export async function insertMessages(db: Db, rows: readonly NewMessageRow[]): Pr
 /* History                                                              */
 /* ------------------------------------------------------------------ */
 
+/** Newest first by id, which within a Job tracks insert time: that order
+ *  comes straight off messages_job_idx (its trailing rowid), so a page reads
+ *  offset + limit rows rather than sorting every message in the Job.
+ *
+ *  `before` (a message id) is the keyset cursor: the page starts just below
+ *  it on the same index, so any page reads only `limit` rows however deep it
+ *  is. When it is given, `offset` is ignored. */
 export async function listMessagesByJob(
   db: Db,
   jobId: string,
-  opts: { limit: number; offset: number },
+  opts: { limit: number; offset?: number; before?: number },
 ) {
   return db
     .select()
     .from(messages)
-    .where(eq(messages.jobId, jobId))
-    .orderBy(desc(messages.createdAt), desc(messages.id))
+    .where(and(eq(messages.jobId, jobId), opts.before === undefined ? undefined : lt(messages.id, opts.before)))
+    .orderBy(desc(messages.id))
     .limit(opts.limit)
-    .offset(opts.offset);
+    .offset(opts.before === undefined ? (opts.offset ?? 0) : 0);
 }
 
+/**
+ * Each row also carries its job's body: a plain request-level message is
+ * stored once on the job, not repeated on every message row, so
+ * `body ?? jobBody` is the text that went out. `templateName` is the
+ * template's current name, null once it has been deleted.
+ *
+ * Always scoped to one App: messages_app_created_idx serves the order, and
+ * `failedOnly` reads messages_app_failed_idx instead — its predicate is a
+ * literal because SQLite only uses a partial index when the query states it.
+ */
 export async function listRecentMessages(
   db: Db,
-  opts: { appId?: number; limit: number; offset: number },
+  opts: { appId: number; failedOnly?: boolean; limit: number; offset: number },
 ) {
-  const where = opts.appId !== undefined ? eq(messages.appId, opts.appId) : undefined;
+  const where = and(eq(messages.appId, opts.appId), opts.failedOnly ? sql`${messages.status} = 'failed'` : undefined);
   return db
-    .select()
+    .select({
+      ...getTableColumns(messages),
+      jobBody: jobs.body,
+      templateId: jobs.templateId,
+      templateName: templates.name,
+    })
     .from(messages)
+    .leftJoin(jobs, eq(jobs.id, messages.jobId))
+    .leftJoin(templates, and(eq(templates.id, jobs.templateId), eq(templates.appId, messages.appId)))
     .where(where)
     .orderBy(desc(messages.createdAt), desc(messages.id))
     .limit(opts.limit)
@@ -752,12 +776,17 @@ export async function setAppDailyQuota(db: Db, id: number, quota: number | null)
 /* ------------------------------------------------------------------ */
 
 /**
- * One cron run's slice of the retention purge (RETENTION_DAYS): message
- * history older than the cutoff, then finished jobs created before it with
- * their chunk rows. Each table is deleted in batches of `batchRows` — the
- * ids picked by a LIMITed subquery, since D1's SQLite has no DELETE ... LIMIT
- * — for at most `maxBatches` rounds, which keeps a run inside its query and
- * duration budget while the 15-minute cron outpaces the write rate.
+ * One cron run's slice of the retention purge (RETENTION_DAYS): finished
+ * jobs created before the cutoff, oldest first, with their messages and
+ * chunk rows. Messages are found through their job (messages_job_idx), so
+ * no index on messages.created_at is paid for on every recipient insert.
+ *
+ * Each round is one batch (one transaction): up to `batchRows` messages of
+ * the oldest purgeable jobs — picked by a LIMITed subquery, since D1's
+ * SQLite has no DELETE ... LIMIT — then the chunks and rows of those jobs
+ * left with no messages. A job with more messages than one round deletes
+ * stays until a later round empties it, so no message outlives its job. At
+ * most `maxBatches` rounds keep a run inside its query and duration budget.
  * Unfinished jobs are never purged; the reaper finishes stalled ones.
  */
 export async function purgeOlderThan(
@@ -768,31 +797,41 @@ export async function purgeOlderThan(
   const cutoff = now() - days * 86400;
 
   let messagesDeleted = 0;
-  for (let batch = 0; batch < opts.maxBatches; batch++) {
-    const ids = db.select({ id: messages.id }).from(messages).where(lt(messages.createdAt, cutoff)).limit(opts.batchRows);
-    const result = await db.delete(messages).where(inArray(messages.id, ids));
-    messagesDeleted += result.meta.changes;
-    if (result.meta.changes < opts.batchRows) break;
-  }
-
   let jobChunksDeleted = 0;
   let jobsDeleted = 0;
   for (let batch = 0; batch < opts.maxBatches; batch++) {
-    // Same deterministic subquery in both statements of one transaction, so
-    // they agree on the set of jobs.
-    const ids = db
+    // Deterministic, so every statement of the batch agrees on the set.
+    const purgeable = db
       .select({ id: jobs.id })
       .from(jobs)
       .where(and(lt(jobs.createdAt, cutoff), isNotNull(jobs.completedAt)))
       .orderBy(asc(jobs.createdAt), asc(jobs.id))
       .limit(opts.batchRows);
-    const [chunksResult, jobsResult] = await db.batch([
-      db.delete(jobChunks).where(inArray(jobChunks.jobId, ids)),
-      db.delete(jobs).where(inArray(jobs.id, ids)),
+    const messageIds = db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(inArray(messages.jobId, purgeable))
+      .limit(opts.batchRows);
+    const [messagesResult, chunksResult, jobsResult] = await db.batch([
+      db.delete(messages).where(inArray(messages.id, messageIds)),
+      db
+        .delete(jobChunks)
+        .where(
+          and(
+            inArray(jobChunks.jobId, purgeable),
+            sql`NOT EXISTS (SELECT 1 FROM ${messages} WHERE ${messages.jobId} = ${jobChunks.jobId})`,
+          ),
+        ),
+      db
+        .delete(jobs)
+        .where(
+          and(inArray(jobs.id, purgeable), sql`NOT EXISTS (SELECT 1 FROM ${messages} WHERE ${messages.jobId} = ${jobs.id})`),
+        ),
     ]);
+    messagesDeleted += messagesResult.meta.changes;
     jobChunksDeleted += chunksResult.meta.changes;
     jobsDeleted += jobsResult.meta.changes;
-    if (jobsResult.meta.changes < opts.batchRows) break;
+    if (messagesResult.meta.changes < opts.batchRows && jobsResult.meta.changes < opts.batchRows) break;
   }
 
   return { messages: messagesDeleted, jobChunks: jobChunksDeleted, jobs: jobsDeleted };

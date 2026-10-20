@@ -13,12 +13,28 @@
  */
 export class ProviderTransportError extends Error {
   readonly failure: "transport" | "provider";
+  /**
+   * What the provider (or the runtime) actually said: a truncated error body,
+   * an unparseable response, or the underlying network error. For logs only —
+   * it stays out of `message`, which becomes the stored, client-visible
+   * failure reason.
+   */
+  readonly detail: string | undefined;
 
-  constructor(message: string, options?: { cause?: unknown; failure?: "transport" | "provider" }) {
+  constructor(
+    message: string,
+    options?: { cause?: unknown; failure?: "transport" | "provider"; detail?: string },
+  ) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = "ProviderTransportError";
     this.failure = options?.failure ?? "transport";
+    this.detail = options?.detail;
   }
+}
+
+/** Log detail of an error caught around a provider request, if it has one. */
+export function detailOf(err: unknown): string | undefined {
+  return err instanceof ProviderTransportError ? err.detail : undefined;
 }
 
 /** 5xx, 408 and 429 are the provider being unavailable or overloaded; any

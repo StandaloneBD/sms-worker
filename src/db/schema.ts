@@ -5,6 +5,7 @@
  * columns, computed via `Math.floor(Date.now() / 1000)` by callers).
  */
 
+import { sql } from "drizzle-orm";
 import { index, int, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { PROVIDER_NAMES } from "../shared/types";
 
@@ -117,7 +118,12 @@ export const jobs = sqliteTable(
     // id breaks created_at ties so paginated listings are stable.
     index("jobs_app_created_idx").on(t.appId, t.createdAt, t.id),
     index("jobs_created_idx").on(t.createdAt, t.id),
-    index("jobs_status_idx").on(t.status),
+    // Partial: only queued/running jobs are in it, so the sync sends that
+    // make up most rows never write to it. Queries must repeat the predicate
+    // as literals (not bound parameters) for SQLite to use the index.
+    index("jobs_unfinished_idx")
+      .on(t.appId, t.status)
+      .where(sql`status IN ('queued', 'running')`),
   ],
 );
 
@@ -172,10 +178,23 @@ export const messages = sqliteTable(
     trackingId: text("tracking_id"),
     createdAt: int("created_at").notNull(),
   },
+  // Messages are the highest-volume write (one row per recipient), and D1
+  // bills every index entry an insert adds as another row written, so each
+  // index here is paid for on every recipient. Nothing indexes created_at
+  // alone: retention purges messages through their jobs, and the stats read
+  // the jobs rollup instead.
   (t) => [
+    // An App's messages newest first. The rowid trails every index, so
+    // ORDER BY created_at DESC, id DESC needs no sort.
     index("messages_app_created_idx").on(t.appId, t.createdAt),
+    // A Job's messages (ORDER BY id DESC, from the trailing rowid), and the
+    // retention purge.
     index("messages_job_idx").on(t.jobId),
-    index("messages_created_idx").on(t.createdAt),
+    // Partial: an App's failed messages, written only for failures, so the
+    // Failed filter and failure reasons never walk the sent ones.
+    index("messages_app_failed_idx")
+      .on(t.appId, t.createdAt)
+      .where(sql`status = 'failed'`),
   ],
 );
 

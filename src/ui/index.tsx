@@ -1,6 +1,6 @@
 /**
  * Admin UI router. Mounted by the orchestrator at /admin — every path
- * registered below is relative ("/login", "/jobs/:id", ...); links, form
+ * registered below is relative ("/login", "/apps/:id/jobs", ...); links, form
  * actions, and redirects inside the pages go through adminPath() to produce
  * the absolute /admin/... URL.
  *
@@ -18,7 +18,7 @@ import { NotFoundPage } from "./components";
 import { readFlash } from "./flash";
 import {
   appActivePost,
-  appDetailGet,
+  appConfigGet,
   appMaskingCreatePost,
   appMaskingDeletePost,
   appProvidersPost,
@@ -29,18 +29,21 @@ import {
   appTemplateCreatePost,
   appTemplateDeletePost,
 } from "./pages/apps";
+import { appOverviewGet } from "./pages/app-overview";
 import { dashboardGet } from "./pages/dashboard";
-import { jobDetailGet, jobsListGet } from "./pages/jobs";
+import { jobDetailGet, jobRedirectGet, jobsListGet } from "./pages/jobs";
 import { loginGet, loginPost, logoutPost } from "./pages/login";
 import { messagesGet } from "./pages/messages";
 import { providersGet, providersPost } from "./pages/providers";
+import { PROVIDER_ORDER_SCRIPT } from "./provider-order";
 import { settingsGet, settingsPost } from "./pages/settings";
 import { templateEditGet, templateEditPost } from "./pages/templates";
 import { authMiddleware, csrfMiddleware } from "./session";
 
 export const adminRoutes = new Hono<AppEnv>({ strict: false });
 
-// Pages run no inline script (confirm prompts come from CONFIRM_SCRIPT);
+// Pages run no inline script (confirm prompts come from CONFIRM_SCRIPT, row
+// details from EXPAND_SCRIPT, provider reordering from PROVIDER_ORDER_SCRIPT);
 // inline styles stay allowed for the shell's <style> block and style attrs.
 const ADMIN_CSP = [
   "default-src 'none'",
@@ -70,7 +73,24 @@ adminRoutes.use("*", async (c, next) => {
 });
 adminRoutes.use("*", requestBodyLimit(64 * 1024));
 
+/**
+ * Disclosure buttons: a [data-expand] button shows/hides the element its
+ * aria-controls names (a message's detail row). The details render hidden;
+ * the shell's <noscript> style reveals them when this can't run.
+ */
+const EXPAND_SCRIPT = `document.addEventListener("click", (event) => {
+  const button = event.target instanceof Element ? event.target.closest("[data-expand]") : null;
+  const target = button && document.getElementById(button.getAttribute("aria-controls"));
+  if (!target) return;
+  const open = button.getAttribute("aria-expanded") !== "true";
+  button.setAttribute("aria-expanded", String(open));
+  target.hidden = !open;
+});
+`;
+
 adminRoutes.get("/confirm.js", (c) => c.body(CONFIRM_SCRIPT, 200, { "content-type": "text/javascript; charset=utf-8" }));
+adminRoutes.get("/expand.js", (c) => c.body(EXPAND_SCRIPT, 200, { "content-type": "text/javascript; charset=utf-8" }));
+adminRoutes.get("/provider-order.js", (c) => c.body(PROVIDER_ORDER_SCRIPT, 200, { "content-type": "text/javascript; charset=utf-8" }));
 
 // CSRF: applies to every route registered below, including /login.
 adminRoutes.use("*", csrfMiddleware);
@@ -86,14 +106,16 @@ adminRoutes.post("/logout", logoutPost);
 
 adminRoutes.get("/", dashboardGet);
 
-adminRoutes.get("/jobs", jobsListGet);
-adminRoutes.get("/jobs/:id", jobDetailGet);
-
-adminRoutes.get("/messages", messagesGet);
+// Jobs and messages belong to an App; a bare job id forwards to its App.
+adminRoutes.get("/jobs/:id", jobRedirectGet);
 
 adminRoutes.get("/apps", appsListGet);
 adminRoutes.post("/apps", appsCreatePost);
-adminRoutes.get("/apps/:id", appDetailGet);
+adminRoutes.get("/apps/:id", appOverviewGet);
+adminRoutes.get("/apps/:id/jobs", jobsListGet);
+adminRoutes.get("/apps/:id/jobs/:jobId", jobDetailGet);
+adminRoutes.get("/apps/:id/messages", messagesGet);
+adminRoutes.get("/apps/:id/config", appConfigGet);
 adminRoutes.post("/apps/:id/active", appActivePost);
 adminRoutes.post("/apps/:id/rotate-key", appRotateKeyPost);
 adminRoutes.post("/apps/:id/providers", appProvidersPost);

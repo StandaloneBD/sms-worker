@@ -39,7 +39,7 @@ describe("admin sessions", () => {
     expect((await request("/v1/templates", { headers: { authorization: `Bearer ${replacement}` } })).status).toBe(200);
     await request(`/admin/apps/${app.id}/active`, { method: "POST", headers, body: new URLSearchParams({ active: "false" }) });
     expect((await request("/v1/templates", { headers: { authorization: `Bearer ${replacement}` } })).status).toBe(403);
-    for (const path of ["/admin", "/admin/apps", `/admin/apps/${app.id}`, "/admin/jobs", "/admin/messages", "/admin/providers", "/admin/settings"]) {
+    for (const path of ["/admin", "/admin/apps", `/admin/apps/${app.id}`, `/admin/apps/${app.id}/jobs`, `/admin/apps/${app.id}/messages`, `/admin/apps/${app.id}/messages?status=failed`, `/admin/apps/${app.id}/config`, "/admin/providers", "/admin/settings"]) {
       expect((await request(path, { headers: { cookie: headers.cookie } })).status).toBe(200);
     }
   });
@@ -85,6 +85,30 @@ describe("admin sessions", () => {
     const res = await request("/admin/login");
     expect(res.headers.get("cache-control")).toBe("no-store");
     expect(res.headers.get("x-frame-options")).toBe("DENY");
+  });
+});
+
+describe("message history", () => {
+  it("shows the text each recipient was sent, whether stored on the message or only on its job", async () => {
+    const admin = await createAdmin(db, { username: "admin", passwordHash: await hashPassword("admin-password") });
+    const token = await signSession(env, { adminId: admin.id, version: admin.sessionVersion }, Math.floor(Date.now() / 1000) + 3600);
+    const cookie = `${SESSION_COOKIE}=${token}`;
+    const created = await request("/admin/apps", { method: "POST", headers: { cookie, origin: "https://sms.test", "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ name: "history-app" }) });
+    const key = (await created.text()).match(/sk_[a-f0-9]{48}/)![0];
+    const api = (path: string, body: unknown) => request(path, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+    const template = (await (await api("/v1/templates", { name: "otp", body: "Code %CODE%" })).json()) as { id: number };
+    const plain = (await (await api("/v1/sms/send", { message: "Order shipped", recipients: ["01712345678"] })).json()) as { id: string };
+    await api("/v1/sms/send", { templateId: template.id, recipients: [{ to: "01812345678", vars: { CODE: "4829" } }] });
+
+    const app = (await listApps(db))[0]!;
+    const page = await (await request(`/admin/apps/${app.id}/messages`, { headers: { cookie } })).text();
+    expect(page).toContain(`<p class="msg-text-body">Order shipped</p>`);
+    expect(page).toContain(`<p class="msg-text-body">Code 4829</p>`);
+    expect(page).toMatch(new RegExp(`href="/admin/apps/\\d+/templates/${template.id}">otp `));
+    const byId = await request(`/admin/jobs/${plain.id}`, { headers: { cookie } });
+    expect(byId.headers.get("location")).toBe(`/admin/apps/${app.id}/jobs/${plain.id}`);
+    const job = await (await request(byId.headers.get("location")!, { headers: { cookie } })).text();
+    expect(job).toContain(`<p class="msg-text-body">Order shipped</p>`);
   });
 });
 

@@ -6,10 +6,10 @@ import { getAppById, getTemplate, updateTemplate } from "../../db/queries";
 import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH } from "../../shared/constants";
 import type { AppEnv } from "../../shared/types";
 import { extractTokens } from "../../sms/template";
-import { Breadcrumb, NotFoundPage, PageHeader, Panel, Segments } from "../components";
+import { AppHeader, NotFoundPage, Panel, Segments } from "../components";
 import { redirectFlash, readFlash } from "../flash";
 import { Layout } from "../layout";
-import { adminPath } from "../paths";
+import { adminPath, appPath } from "../paths";
 import { formStr, parseId } from "../util";
 
 export async function templateEditGet(c: Context<AppEnv>): Promise<Response> {
@@ -33,17 +33,11 @@ export async function templateEditGet(c: Context<AppEnv>): Promise<Response> {
   const flash = readFlash(c);
 
   return c.html(
-    <Layout title={tpl.name} active="apps" flash={flash}>
-      <Breadcrumb
-        items={[
-          { label: "Apps", href: adminPath("/apps") },
-          { label: app.name, href: adminPath(`/apps/${app.id}`) },
-          { label: tpl.name },
-        ]}
-      />
-      <PageHeader eyebrow="TEMPLATE" title={tpl.name} />
+    <Layout title={`${tpl.name} · ${app.name}`} active="apps" flash={flash}>
+      <AppHeader app={app} tab="config" trail={tpl.name} />
 
-      <Panel>
+      <Panel title={`Template #${tpl.id}`}>
+        <p class="muted panel-note">Send it with "templateId": {tpl.id}.</p>
         <form method="post" action={adminPath(`/apps/${id}/templates/${templateId}`)}>
           <div class="form-row">
             <div class="field">
@@ -143,5 +137,5 @@ export async function templateEditPost(c: Context<AppEnv>): Promise<Response> {
     return c.html(<NotFoundPage flash={readFlash(c)} what="Template" />, 404);
   }
 
-  return redirectFlash(c, adminPath(`/apps/${id}`), "Template updated.");
+  return redirectFlash(c, appPath(id, "config"), "Template updated.");
 }

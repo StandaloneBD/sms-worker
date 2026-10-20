@@ -4,10 +4,10 @@
  * handle every other query helper takes — src/db itself is untouched.
  */
 
-import { asc, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "../db/queries";
 import { getGlobalProviders, listApps } from "../db/queries";
-import { admins, apps, appProviders, jobs, messages } from "../db/schema";
+import { admins, appProviders, jobs, messages } from "../db/schema";
 import { PROVIDER_NAMES } from "../shared/types";
 import type { ProviderName } from "../shared/types";
 
@@ -33,6 +33,9 @@ export interface AppProviderRow {
   /** False when the admin disabled the provider globally — a kill switch
    *  that overrides `enabled` here (see getAppProviderPlan). */
   globallyEnabled: boolean;
+  /** True while the App has no plan of its own and so follows the global
+   *  order; saving the form creates its plan. Same for every row. */
+  inherited: boolean;
 }
 
 /**
@@ -63,7 +66,7 @@ export async function getAppProviderRows(db: Db, appId: number): Promise<AppProv
     const global = globalMap.get(provider);
     const globallyEnabled = global?.enabled ?? false;
     const override = overrideMap.get(provider);
-    if (override) return { ...override, globallyEnabled };
+    if (override) return { ...override, globallyEnabled, inherited: false };
     // An App with any override rows uses those exclusively, so a provider
     // without a row isn't in its plan.
     return {
@@ -71,50 +74,181 @@ export async function getAppProviderRows(db: Db, appId: number): Promise<AppProv
       enabled: overrides.length === 0 && globallyEnabled,
       priority: global?.priority ?? 100,
       globallyEnabled,
+      inherited: overrides.length === 0,
     };
   });
 }
 
-export interface DashboardStats {
-  sent24h: number;
-  failed24h: number;
-  jobsRunning: number;
-  jobsQueued: number;
-  activeApps: number;
+/** Days of history the volume charts plot, today (UTC, partial) last. */
+export const CHART_DAYS = 14;
+
+/** Sent / failed recipient counts per day, oldest first; aligned with `DailyVolume.days`. */
+export interface DailySeries {
+  sent: number[];
+  failed: number[];
+}
+
+export interface DailyVolume {
+  /** Unix day numbers (seconds / 86400, UTC), oldest first. */
+  days: number[];
+  total: DailySeries;
+  byApp: Map<number, DailySeries>;
+}
+
+function emptySeries(length: number): DailySeries {
+  return { sent: new Array<number>(length).fill(0), failed: new Array<number>(length).fill(0) };
 }
 
 /**
- * Overview-page stat row. 3 D1 queries total: messages grouped by status
- * (last 24h), queued/running jobs grouped by status (a jobs_status_idx seek,
- * not a scan of every job ever — each sync send adds a jobs row), and a
- * count of active apps.
+ * Per-day delivery volume over the last `days` UTC days, overall and per App.
+ * Summed from the jobs rollup (one row per Send or Job) rather than counted
+ * from messages (one row per recipient), so a chart reads a row per request,
+ * not per recipient. A Job's recipients count toward the day it was accepted.
  */
-export async function dashboardStats(db: Db): Promise<DashboardStats> {
-  const since = Math.floor(Date.now() / 1000) - DAY_SECONDS;
+export async function dailyVolume(db: Db, opts: { appId?: number; days?: number } = {}): Promise<DailyVolume> {
+  const length = opts.days ?? CHART_DAYS;
+  const today = Math.floor(Date.now() / 1000 / DAY_SECONDS);
+  const first = today - length + 1;
+  const days = Array.from({ length }, (_, i) => first + i);
 
-  const [messageCounts, jobCounts, activeAppRows] = await Promise.all([
+  // Integer columns, so SQLite divides integrally: the UTC day number.
+  const day = sql<number>`${jobs.createdAt} / 86400`;
+  const since = gte(jobs.createdAt, first * DAY_SECONDS);
+  const rows = await db
+    .select({
+      appId: jobs.appId,
+      day,
+      sent: sql<number>`sum(${jobs.sent})`,
+      failed: sql<number>`sum(${jobs.failed})`,
+    })
+    .from(jobs)
+    .where(opts.appId !== undefined ? and(eq(jobs.appId, opts.appId), since) : since)
+    // Day first: grouping by app_id first lets SQLite walk all of
+    // jobs_app_created_idx (every job ever kept) to skip the group sort,
+    // instead of seeking the date range on jobs_created_idx.
+    .groupBy(day, jobs.appId);
+
+  const total = emptySeries(length);
+  const byApp = new Map<number, DailySeries>();
+  for (const row of rows) {
+    const i = row.day - first;
+    if (i < 0 || i >= length) continue;
+    let series = byApp.get(row.appId);
+    if (!series) byApp.set(row.appId, (series = emptySeries(length)));
+    series.sent[i]! += row.sent;
+    series.failed[i]! += row.failed;
+    total.sent[i]! += row.sent;
+    total.failed[i]! += row.failed;
+  }
+  return { days, total, byApp };
+}
+
+export interface InFlight {
+  running: number;
+  queued: number;
+}
+
+export interface DeliveryStats {
+  sent24h: number;
+  failed24h: number;
+  inFlight: InFlight;
+  inFlightByApp: Map<number, InFlight>;
+}
+
+/**
+ * Stat tiles, overall or for one App: recipients sent and failed by the
+ * Sends and Jobs accepted in the last 24h (the jobs rollup, one row per
+ * request, like dailyVolume), and queued/running jobs per App from the
+ * partial jobs_unfinished_idx, which holds only those.
+ */
+export async function deliveryStats(db: Db, appId?: number): Promise<DeliveryStats> {
+  const since = Math.floor(Date.now() / 1000) - DAY_SECONDS;
+  const recent = gte(jobs.createdAt, since);
+  // Literal, not bound: SQLite only uses a partial index whose predicate the
+  // query states outright.
+  const unfinished = sql`${jobs.status} IN ('queued', 'running')`;
+
+  const [totals, jobCounts] = await Promise.all([
     db
-      .select({ status: messages.status, count: sql<number>`count(*)` })
-      .from(messages)
-      .where(gte(messages.createdAt, since))
-      .groupBy(messages.status),
-    db
-      .select({ status: jobs.status, count: sql<number>`count(*)` })
+      .select({ sent: sql<number>`coalesce(sum(${jobs.sent}), 0)`, failed: sql<number>`coalesce(sum(${jobs.failed}), 0)` })
       .from(jobs)
-      .where(inArray(jobs.status, ["queued", "running"]))
-      .groupBy(jobs.status),
-    db.select({ count: sql<number>`count(*)` }).from(apps).where(eq(apps.isActive, true)),
+      .where(appId !== undefined ? and(eq(jobs.appId, appId), recent) : recent),
+    db
+      .select({ appId: jobs.appId, status: jobs.status, count: sql<number>`count(*)` })
+      .from(jobs)
+      .where(appId !== undefined ? and(eq(jobs.appId, appId), unfinished) : unfinished)
+      .groupBy(jobs.appId, jobs.status),
   ]);
 
-  const messageByStatus = new Map(messageCounts.map((r) => [r.status, r.count]));
-  const jobByStatus = new Map(jobCounts.map((r) => [r.status, r.count]));
+  const inFlight: InFlight = { running: 0, queued: 0 };
+  const inFlightByApp = new Map<number, InFlight>();
+  for (const row of jobCounts) {
+    let entry = inFlightByApp.get(row.appId);
+    if (!entry) inFlightByApp.set(row.appId, (entry = { running: 0, queued: 0 }));
+    const key = row.status === "running" ? "running" : "queued";
+    entry[key] += row.count;
+    inFlight[key] += row.count;
+  }
 
   return {
-    sent24h: messageByStatus.get("sent") ?? 0,
-    failed24h: messageByStatus.get("failed") ?? 0,
-    jobsRunning: jobByStatus.get("running") ?? 0,
-    jobsQueued: jobByStatus.get("queued") ?? 0,
-    activeApps: activeAppRows[0]?.count ?? 0,
+    sent24h: totals[0]?.sent ?? 0,
+    failed24h: totals[0]?.failed ?? 0,
+    inFlight,
+    inFlightByApp,
+  };
+}
+
+export interface ProviderShare {
+  /** null when no provider was tried (e.g. none enabled for the App). */
+  provider: string | null;
+  sent: number;
+  failed: number;
+}
+
+export interface FailureReason {
+  reason: string | null;
+  count: number;
+}
+
+export interface AppBreakdown {
+  providers: ProviderShare[];
+  reasons: FailureReason[];
+}
+
+/** Over an App's last `days` of messages: which providers carried them
+ *  (every message in the messages_app_created_idx range — the one per-view
+ *  read that grows with volume), and the most common reasons recipients
+ *  failed (failures only, from the partial messages_app_failed_idx). */
+export async function appBreakdown(db: Db, appId: number, days: number): Promise<AppBreakdown> {
+  const since = Math.floor(Date.now() / 1000) - days * DAY_SECONDS;
+  const scope = and(eq(messages.appId, appId), gte(messages.createdAt, since));
+  const count = sql<number>`count(*)`;
+
+  const [providerRows, reasonRows] = await Promise.all([
+    db
+      .select({ provider: messages.provider, status: messages.status, count })
+      .from(messages)
+      .where(scope)
+      .groupBy(messages.provider, messages.status),
+    db
+      .select({ reason: messages.reason, count })
+      .from(messages)
+      .where(and(scope, sql`${messages.status} = 'failed'`))
+      .groupBy(messages.reason)
+      .orderBy(desc(count))
+      .limit(5),
+  ]);
+
+  const byProvider = new Map<string | null, ProviderShare>();
+  for (const row of providerRows) {
+    let share = byProvider.get(row.provider);
+    if (!share) byProvider.set(row.provider, (share = { provider: row.provider, sent: 0, failed: 0 }));
+    share[row.status] += row.count;
+  }
+
+  return {
+    providers: [...byProvider.values()].sort((a, b) => b.sent + b.failed - (a.sent + a.failed)),
+    reasons: reasonRows,
   };
 }
 

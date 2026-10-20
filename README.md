@@ -171,6 +171,13 @@ curl https://sms.shihabmridha.com/v1/sms/jobs/<jobId>          # progress
 curl https://sms.shihabmridha.com/v1/sms/jobs/<jobId>/messages # per-recipient
 ```
 
+`/messages` pages newest first (`limit` 1-200, default 50). Page with
+`?before=<nextBefore>`: each response carries `nextBefore`, the cursor for
+the next page, and it is `null` once a page comes back short. Each cursor
+page costs only `limit` rows however deep it is. `?offset=` still works,
+but each page reads every row before it too, so a large job costs far
+more to walk that way. `offset` is ignored when `before` is given.
+
 Each recipient's body is its own `message` if given, else the rendered
 template, else the request-level `message`.
 

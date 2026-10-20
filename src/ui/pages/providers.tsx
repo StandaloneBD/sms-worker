@@ -12,17 +12,24 @@ import { getGlobalProviderRows } from "../data";
 import { redirectFlash, readFlash } from "../flash";
 import { Layout } from "../layout";
 import { adminPath } from "../paths";
+import {
+  EnabledSwitch,
+  PROVIDER_LABELS,
+  PriorityField,
+  ProviderOrderFoot,
+  ProviderOrderScript,
+  ProviderSlot,
+  ProviderTitle,
+  rankCounter,
+} from "../provider-order";
 import { formChecked, formStr, formatTs, parseIntOr, providerCredentialError } from "../util";
-
-const PROVIDER_LABELS: Record<ProviderName, string> = {
-  bulksmsbd: "BulkSMSBD",
-  mimsms: "MimSms",
-};
 
 export async function providersGet(c: Context<AppEnv>): Promise<Response> {
   const db = getDb(c.env);
-  const rows = await getGlobalProviderRows(db);
+  // Listed in priority order, which is the order sends try them in.
+  const rows = (await getGlobalProviderRows(db)).sort((a, b) => a.priority - b.priority);
   const flash = readFlash(c);
+  const nextRank = rankCounter();
 
   return c.html(
     <Layout title="Providers" active="providers" flash={flash}>
@@ -33,117 +40,92 @@ export async function providersGet(c: Context<AppEnv>): Promise<Response> {
       />
       <Panel flush>
         <form method="post" action={adminPath("/providers")}>
-          <div class="table-wrap">
-            <table class="data">
-              <thead>
-                <tr>
-                  <th>Provider</th>
-                  <th>Enabled</th>
-                  <th>Priority</th>
-                  <th>Sender ID</th>
-                  <th>Username</th>
-                  <th>Sender name</th>
-                  <th>API key</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row) => (
-                  <tr>
-                    <td>{PROVIDER_LABELS[row.provider]}</td>
-                    <td>
-                      <input
-                        class="check"
-                        type="checkbox"
-                        name={`${row.provider}_enabled`}
-                        value="on"
-                        checked={row.enabled}
-                      />
-                    </td>
-                    <td>
-                      <input
-                        class="input"
-                        type="number"
-                        name={`${row.provider}_priority`}
-                        value={String(row.priority)}
-                        style="width:90px"
-                      />
-                    </td>
-                    <td>
-                      {row.provider === "bulksmsbd" ? (
+          <ol class="prov-list" data-prov-list>
+            {rows.map((row) => {
+              const id = (field: string) => `${row.provider}-${field}`;
+              const rank = nextRank(row.enabled);
+              return (
+                <li class="prov" data-prov={PROVIDER_LABELS[row.provider]}>
+                  <ProviderSlot rank={rank} />
+
+                  <div class="prov-ident">
+                    <ProviderTitle provider={row.provider} rank={rank} />
+                    <EnabledSwitch provider={row.provider} checked={row.enabled} />
+                    <PriorityField provider={row.provider} priority={row.priority} />
+                  </div>
+
+                  <div class="prov-fields">
+                    {row.provider === "bulksmsbd" ? (
+                      <div class="field">
+                        <label for={id("sender-id")}>Sender ID</label>
                         <input
                           class="input mono"
                           type="text"
+                          id={id("sender-id")}
                           name={`${row.provider}_senderId`}
                           value={row.senderId ?? ""}
-                          placeholder="numeric sender id"
+                          placeholder="Numeric sender ID"
                         />
-                      ) : (
-                        <span class="muted">Not used</span>
-                      )}
-                    </td>
-                    <td>
-                      {row.provider === "mimsms" ? (
-                        <input
-                          class="input mono"
-                          type="text"
-                          name={`${row.provider}_username`}
-                          value={row.username ?? ""}
-                          placeholder="username"
-                        />
-                      ) : (
-                        <span class="muted">Not used</span>
-                      )}
-                    </td>
-                    <td>
-                      {row.provider === "mimsms" ? (
-                        <input
-                          class="input"
-                          type="text"
-                          name={`${row.provider}_senderName`}
-                          value={row.senderName ?? ""}
-                          placeholder="sender name"
-                        />
-                      ) : (
-                        <span class="muted">Not used</span>
-                      )}
-                    </td>
-                    <td>
-                      <div style="display:flex;flex-direction:column;gap:6px">
-                        <span class={row.hasApiKey ? undefined : "muted"}>
-                          {row.hasApiKey
-                            ? row.updatedAt !== null
-                              ? `set · updated ${formatTs(row.updatedAt)}`
-                              : "set"
-                            : "not set"}
-                        </span>
-                        <input
-                          class="input mono"
-                          type="password"
-                          name={`${row.provider}_apiKey`}
-                          autocomplete="new-password"
-                          placeholder="leave blank to keep"
-                        />
-                        <label
-                          class="mono"
-                          style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)"
-                        >
-                          <input class="check" type="checkbox" name={`${row.provider}_clearApiKey`} value="on" />
-                          Remove key
-                        </label>
                       </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <div class="panel-foot">
-            <button type="submit" class="btn btn-primary">
-              Save
-            </button>
-          </div>
+                    ) : null}
+                    {row.provider === "mimsms" ? (
+                      <>
+                        <div class="field">
+                          <label for={id("username")}>Username</label>
+                          <input
+                            class="input mono"
+                            type="text"
+                            id={id("username")}
+                            name={`${row.provider}_username`}
+                            value={row.username ?? ""}
+                          />
+                        </div>
+                        <div class="field">
+                          <label for={id("sender-name")}>Sender name</label>
+                          <input
+                            class="input"
+                            type="text"
+                            id={id("sender-name")}
+                            name={`${row.provider}_senderName`}
+                            value={row.senderName ?? ""}
+                          />
+                        </div>
+                      </>
+                    ) : null}
+                    <div class="field prov-key">
+                      <div class="prov-key-head">
+                        <label for={id("api-key")}>API key</label>
+                        <span class={row.hasApiKey ? "badge badge-on" : "badge"}>
+                          {row.hasApiKey ? "Saved" : "Not set"}
+                        </span>
+                      </div>
+                      <input
+                        class="input mono"
+                        type="password"
+                        id={id("api-key")}
+                        name={`${row.provider}_apiKey`}
+                        autocomplete="new-password"
+                        placeholder={row.hasApiKey ? "Leave blank to keep" : "Paste API key"}
+                      />
+                      {row.hasApiKey ? (
+                        <div class="prov-key-foot">
+                          {row.updatedAt !== null ? <span>Updated {formatTs(row.updatedAt)}</span> : <span />}
+                          <label>
+                            <input class="check" type="checkbox" name={`${row.provider}_clearApiKey`} value="on" />
+                            Remove key
+                          </label>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+          <ProviderOrderFoot saveLabel="Save providers" />
         </form>
       </Panel>
+      <ProviderOrderScript />
     </Layout>,
   );
 }
@@ -200,5 +182,5 @@ export async function providersPost(c: Context<AppEnv>): Promise<Response> {
   await upsertGlobalProviders(db, parsed);
 
   await invalidateAllAppConfigs(c.env);
-  return redirectFlash(c, adminPath("/providers"), "Global provider settings saved.");
+  return redirectFlash(c, adminPath("/providers"), "Providers saved.");
 }
