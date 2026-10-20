@@ -33,36 +33,99 @@ Domain language: [CONTEXT.md](./CONTEXT.md). Key decisions:
 
 ## Setup
 
-```sh
-npm install
+### 1. Resources
 
-# 1. Create resources (once)
-npx wrangler d1 create sms-worker           # put database_id into wrangler.jsonc
-npx wrangler kv namespace create sms-worker # put id into wrangler.jsonc
+Created once per Cloudflare account; `wrangler.jsonc` already points at them.
+
+| Binding     | Resource                          | Name                              |
+| ----------- | --------------------------------- | --------------------------------- |
+| `DB`        | D1 database                       | `sms-worker`                      |
+| `CACHE`     | KV namespace                      | `sms-worker`                      |
+| `PAYLOADS`  | R2 bucket                         | `sms-worker`                      |
+| `SMS_QUEUE` | Queue (producer + consumer)       | `sms-worker-job`                  |
+| —           | Dead-letter queue (consumer)      | `sms-worker-dlq`                  |
+
+```sh
+npx wrangler d1 create sms-worker            # put database_id into wrangler.jsonc
+npx wrangler kv namespace create sms-worker  # put id into wrangler.jsonc
 npx wrangler r2 bucket create sms-worker
 npx wrangler queues create sms-worker-job
-npx wrangler queues create sms-worker-dlq          # keep the "-dlq" suffix if renamed
+npx wrangler queues create sms-worker-dlq    # keep the "-dlq" suffix if renamed
 # Backstop for job objects whose cleanup failed (normally deleted on completion)
 npx wrangler r2 bucket lifecycle add sms-worker expire-jobs jobs/ --expire-days 7
-
-# 2. Migrations
-npm run db:migrate:local     # local dev
-npm run db:migrate:remote    # production D1
-
-# 3. Secrets (production) — the worker refuses to run with these missing or
-#    shorter than 16 characters
-npx wrangler secret put ENCRYPTION_KEY           # any long random string
-npx wrangler secret put SESSION_SECRET           # any long random string
-npx wrangler secret put ADMIN_BOOTSTRAP_PASSWORD
-
-# 4. Run / deploy
-npm run dev                  # local (FAKE_SMS=true via .dev.vars)
-npm run deploy               # deploys to sms.shihabmridha.com
 ```
+
+The Worker is served only on the custom domain `sms.shihabmridha.com`
+(`workers_dev` and `preview_urls` are off), so the zone must be on the same
+account.
+
+### 2. Migrations
+
+Run before deploying any commit that adds a file under `drizzle/` — new code
+expects the new schema. The Git build token has no D1 access, so this is a
+manual step.
+
+```sh
+npm run db:migrate:remote    # production D1
+```
+
+### 3. Secrets
+
+Runtime secrets on the `sms-worker` Worker. Sign-in and provider calls fail
+while they're missing; `ENCRYPTION_KEY` and `SESSION_SECRET` must be at least
+16 characters (long random strings).
+
+| Secret                     | Purpose                                              |
+| -------------------------- | ---------------------------------------------------- |
+| `ENCRYPTION_KEY`           | Encrypts provider API keys stored in D1              |
+| `SESSION_SECRET`           | Signs admin session cookies                          |
+| `ADMIN_BOOTSTRAP_PASSWORD` | First admin sign-in (only while no admin exists)     |
+
+```sh
+npx wrangler secret put ENCRYPTION_KEY
+npx wrangler secret put SESSION_SECRET
+npx wrangler secret put ADMIN_BOOTSTRAP_PASSWORD
+npx wrangler secret list     # all three names should be listed
+```
+
+Or in the dashboard: Workers & Pages → sms-worker → Settings → Variables and
+Secrets → Add, type **Secret**, then click **Deploy** — nothing is saved until
+you do. Don't use the Build variables section: build variables are not
+available to the Worker at runtime. Secrets persist across deploys; changing
+`ENCRYPTION_KEY` makes stored provider keys unreadable, and changing
+`SESSION_SECRET` signs every admin out.
+
+### 4. Deploy
+
+Deploys run from GitHub through Workers Builds (Worker → Settings → Build):
+
+| Setting                       | Value                               |
+| ----------------------------- | ----------------------------------- |
+| Build command                 | `npm run typecheck && npm test`     |
+| Deploy command                | `npx wrangler deploy`               |
+| Root directory                | `/`                                 |
+| Non-production branch builds  | Off                                 |
+
+Pushing to `master` deploys. Dependencies are installed from the lockfile
+automatically. Branch builds stay off: their Previews would share the
+production D1, queues and bucket. To deploy by hand instead:
+`npm run deploy`.
 
 First admin login: username `admin` + the `ADMIN_BOOTSTRAP_PASSWORD` value
 (only works while no admin exists; change the password in Settings after).
 Register an App in the UI — the API key is shown exactly once.
+
+### Local development
+
+```sh
+npm install
+cp .dev.vars.example .dev.vars   # FAKE_SMS=true: no provider calls
+npm run db:migrate:local
+npm run dev                      # http://localhost:8787/admin
+```
+
+The admin session cookie is `__Host-` prefixed (Secure only); Chrome and
+Firefox accept it on `http://localhost`, Safari may not.
 
 ### 5. Provider credentials
 
