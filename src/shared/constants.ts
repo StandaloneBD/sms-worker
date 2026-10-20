@@ -76,7 +76,7 @@ export const SEND_RETRY_BASE_SECONDS = 60;
 
 /** Reaper (cron): a pending chunk with no progress for this long is
  *  re-enqueued. Has to outlast one round's whole queue retry span (≈31 min
- *  of RETRY_* backoff on sms-jobs, then the DLQ's retries) plus a send-round
+ *  of RETRY_* backoff on sms-worker-job, then the DLQ's retries) plus a send-round
  *  delay, so a chunk that is merely slow is never double-enqueued. */
 export const CHUNK_STALE_SECONDS = 2 * 60 * 60;
 /** Re-enqueues of one chunk before the reaper fails it outright. */
@@ -133,8 +133,11 @@ export const r2ChunkResultsKey = (jobId: string, chunkIndex: number, round: numb
 /** Single-document payload of Jobs created before NDJSON payloads. */
 export const r2LegacyJobKey = (jobId: string) => `jobs/${jobId}.json`;
 
-/** Session cookie name for the admin UI. */
-export const SESSION_COOKIE = "sms_admin_session";
+/** Session cookie name for the admin UI. The __Host- prefix makes browsers
+ *  accept it only Secure, host-only, and Path=/, so a sibling subdomain
+ *  can't set or shadow it. (http://localhost still works: browsers treat it
+ *  as a secure context.) */
+export const SESSION_COOKIE = "__Host-sms_admin_session";
 export const SESSION_TTL_SECONDS = 12 * 60 * 60;
 /** Upper bound on admin password input (PBKDF2 cost grows with it). */
 export const MAX_PASSWORD_LENGTH = 1024;

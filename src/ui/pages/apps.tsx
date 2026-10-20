@@ -189,7 +189,7 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
             <form
               method="post"
               action={adminPath(`/apps/${app.id}/rotate-key`)}
-              onsubmit="return confirm('Rotate this app’s API key? The current key will stop working immediately.')"
+              data-confirm="Rotate this app’s API key? The current key will stop working immediately."
             >
               <button type="submit" class="btn btn-danger">
                 Rotate key
@@ -329,7 +329,7 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
                       <form
                         method="post"
                         action={adminPath(`/apps/${app.id}/masking-profiles/${profile.id}/delete`)}
-                        onsubmit="return confirm('Delete this masking profile? This cannot be undone.')"
+                        data-confirm="Delete this masking profile? This cannot be undone."
                       >
                         <button type="submit" class="btn btn-danger btn-sm">
                           Delete
@@ -417,7 +417,7 @@ export async function appDetailGet(c: Context<AppEnv>): Promise<Response> {
                         <form
                           method="post"
                           action={adminPath(`/apps/${app.id}/templates/${tpl.id}/delete`)}
-                          onsubmit="return confirm('Delete this template? This cannot be undone.')"
+                          data-confirm="Delete this template? This cannot be undone."
                         >
                           <button type="submit" class="btn btn-danger btn-sm">
                             Delete

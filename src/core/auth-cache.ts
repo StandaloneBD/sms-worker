@@ -6,7 +6,7 @@
  * best-effort, swallow-and-log, never throw or block the caller on KV.
  */
 
-import { KV_TTL_SECONDS, kvAppByKeyHash } from "../shared/constants";
+import { kvAppByKeyHash } from "../shared/constants";
 import type { AuthedApp } from "../shared/types";
 
 export async function writeAppAuthCache(
@@ -14,9 +14,10 @@ export async function writeAppAuthCache(
   keyHash: string,
   authed: AuthedApp,
 ): Promise<void> {
-  await env.CACHE.put(kvAppByKeyHash(keyHash), JSON.stringify(authed), {
-    expirationTtl: KV_TTL_SECONDS,
-  }).catch((err: unknown) => {
+  // No TTL: the request path no longer re-reads KV to refresh an expiring
+  // entry (it confirms each key once per isolate), so an expired entry would
+  // leave the outage shield cold. Admin mutations overwrite or delete it.
+  await env.CACHE.put(kvAppByKeyHash(keyHash), JSON.stringify(authed)).catch((err: unknown) => {
     console.warn(
       JSON.stringify({ event: "auth_cache_write_failed", error: String(err) }),
     );

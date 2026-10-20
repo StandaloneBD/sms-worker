@@ -13,7 +13,11 @@
   },
   // Custom domain; the zone must exist on this Cloudflare account.
   "routes": [{ "pattern": "sms.shihabmridha.com", "custom_domain": true }],
-  "workers_dev": true,
+  // Served only on the custom domain: workers.dev and per-version Preview
+  // URLs would be extra public hostnames for the admin UI and API that skip
+  // any zone-level WAF, Access, or rate-limit rules on that domain.
+  "workers_dev": false,
+  "preview_urls": false,
   "vars": {
     "FAKE_SMS": "false",
     // Comma-separated browser origins allowed to call /v1 (CORS), or "*" for
@@ -26,32 +30,30 @@
     {
       "binding": "DB",
       "database_name": "sms-worker",
-      // Replace after `wrangler d1 create sms-worker` (local dev works without).
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "42a92c76-6bb8-497f-8c8c-6e1c5c365983",
       "migrations_dir": "drizzle"
     }
   ],
   "kv_namespaces": [
     {
       "binding": "CACHE",
-      // Replace after `wrangler kv namespace create CACHE`.
-      "id": "00000000000000000000000000000000"
+      "id": "0745e357ac8a4cf3928baa67142d8bd9"
     }
   ],
   "r2_buckets": [
     {
       "binding": "PAYLOADS",
-      "bucket_name": "sms-worker-payloads"
+      "bucket_name": "sms-worker"
     }
   ],
   "queues": {
-    "producers": [{ "binding": "SMS_QUEUE", "queue": "sms-jobs" }],
+    "producers": [{ "binding": "SMS_QUEUE", "queue": "sms-worker-job" }],
     // The consumer routes by name: a queue whose name ends in "-dlq" is the
     // dead-letter queue, every other queue is chunk processing — keep that
     // suffix when renaming queues per environment.
     "consumers": [
       {
-        "queue": "sms-jobs",
+        "queue": "sms-worker-job",
         // Workers Free allows 50 D1 queries per invocation; one chunk (250
         // recipients ≈ 25 batched inserts) per invocation stays under it.
         "max_batch_size": 1,
@@ -60,10 +62,10 @@
         // D1 (single writer) from returning "overloaded" mid-chunk, which
         // would force a redelivery. ~5 × 250 recipients every few seconds.
         "max_concurrency": 5,
-        "dead_letter_queue": "sms-dlq"
+        "dead_letter_queue": "sms-worker-dlq"
       },
       {
-        "queue": "sms-dlq",
+        "queue": "sms-worker-dlq",
         // Also 1: recording one dead-lettered chunk costs ~30 D1 queries
         // (history inserts + finalize), and Workers Free caps an invocation
         // at 50 — ten DLQ messages per batch would blow that budget.

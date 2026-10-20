@@ -4,9 +4,9 @@
  * "-dlq" is the dead-letter queue, every other queue is chunk processing
  * (by suffix, so per-environment queue names keep working):
  *
- *  - chunk processing ("sms-jobs", max_retries 5, DLQ "sms-dlq"): one send
+ *  - chunk processing ("sms-worker-job", max_retries 5, DLQ "sms-worker-dlq"): one send
  *    round of one chunk per message (ADR 0005).
- *  - dead-letter ("sms-dlq", max_retries 3, then the message drops — the
+ *  - dead-letter ("sms-worker-dlq", max_retries 3, then the message drops — the
  *    reaper is the backstop): force-finishes the chunk.
  *
  * Ordering on the main path is load-bearing (ADR 0002: prefer duplicate
@@ -261,7 +261,7 @@ async function afterSettle(
 }
 
 /* ------------------------------------------------------------------ */
-/* Chunk processing ("sms-jobs")                                        */
+/* Chunk processing ("sms-worker-job")                                        */
 /* ------------------------------------------------------------------ */
 
 async function processChunkMessage(msg: Message<unknown>, env: Env, db: Db): Promise<void> {
@@ -401,7 +401,7 @@ async function processChunkMessage(msg: Message<unknown>, env: Env, db: Db): Pro
 }
 
 /* ------------------------------------------------------------------ */
-/* Force-finish: dead-lettered ("sms-dlq") or abandoned (reaper) chunks */
+/* Force-finish: dead-lettered ("sms-worker-dlq") or abandoned (reaper) chunks */
 /* ------------------------------------------------------------------ */
 
 /**

@@ -24,7 +24,7 @@ Domain language: [CONTEXT.md](./CONTEXT.md). Key decisions:
   (ranged GET). Recipients that fail for a transport or provider-side reason
   are retried in later send rounds (60 s, 120 s, 240 s); each round's results
   are checkpointed to R2 so a redelivery never sends them twice (ADR 0005).
-  Infrastructure errors retry with backoff, then dead-letter to `sms-dlq`.
+  Infrastructure errors retry with backoff, then dead-letter to `sms-worker-dlq`.
 - **Cron (every 15 min)** — re-enqueues stalled chunks (and fails them after
   3 tries) so every job finishes, then purges a bounded slice of expired
   history, jobs, idempotency keys and usage rows.
@@ -38,12 +38,12 @@ npm install
 
 # 1. Create resources (once)
 npx wrangler d1 create sms-worker           # put database_id into wrangler.jsonc
-npx wrangler kv namespace create CACHE      # put id into wrangler.jsonc
-npx wrangler r2 bucket create sms-worker-payloads
-npx wrangler queues create sms-jobs
-npx wrangler queues create sms-dlq          # keep the "-dlq" suffix if renamed
+npx wrangler kv namespace create sms-worker # put id into wrangler.jsonc
+npx wrangler r2 bucket create sms-worker
+npx wrangler queues create sms-worker-job
+npx wrangler queues create sms-worker-dlq          # keep the "-dlq" suffix if renamed
 # Backstop for job objects whose cleanup failed (normally deleted on completion)
-npx wrangler r2 bucket lifecycle add sms-worker-payloads expire-jobs jobs/ --expire-days 7
+npx wrangler r2 bucket lifecycle add sms-worker expire-jobs jobs/ --expire-days 7
 
 # 2. Migrations
 npm run db:migrate:local     # local dev

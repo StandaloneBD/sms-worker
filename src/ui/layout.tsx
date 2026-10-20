@@ -1,9 +1,9 @@
 /**
  * Single shared page shell ("Switchboard"): a top rail (brand, nav, admin /
  * sign-out), a max-width page column, and one inline <style> block. No
- * external assets besides the Google Fonts link, no client-side JS beyond
- * the inline confirm() attached to individual destructive-button forms in
- * the pages themselves (this file renders no <script>).
+ * external assets besides the Google Fonts link, and no client-side JS
+ * beyond /admin/confirm.js, which prompts before submitting any form with a
+ * data-confirm attribute (the admin CSP forbids inline script).
  *
  * The CSS is injected via dangerouslySetInnerHTML: hono/jsx escapes text
  * children by default (including inside <style>, an HTML "raw text"
@@ -703,6 +703,7 @@ function Head({ title }: { title: string }) {
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
       <link rel="stylesheet" href={FONTS_HREF} />
       <style dangerouslySetInnerHTML={{ __html: CSS }} />
+      <script src={adminPath("/confirm.js")} defer />
     </head>
   );
 }

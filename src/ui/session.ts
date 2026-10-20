@@ -18,10 +18,6 @@ import type { AppEnv } from "../shared/types";
 import { getAdminById } from "./data";
 import { adminPath } from "./paths";
 
-function isHttps(c: Context<AppEnv>): boolean {
-  return new URL(c.req.url).protocol === "https:";
-}
-
 /** Signs a fresh session token (exp = now + SESSION_TTL_SECONDS) and sets the cookie. */
 export async function createSession(c: Context<AppEnv>, claims: SessionClaims): Promise<void> {
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
@@ -30,14 +26,14 @@ export async function createSession(c: Context<AppEnv>, claims: SessionClaims): 
     httpOnly: true,
     sameSite: "Lax",
     path: "/",
-    secure: isHttps(c),
+    secure: true,
     maxAge: SESSION_TTL_SECONDS,
   });
 }
 
 /** Clears the session cookie (logout). */
 export function clearSession(c: Context<AppEnv>): void {
-  deleteCookie(c, SESSION_COOKIE, { path: "/" });
+  deleteCookie(c, SESSION_COOKIE, { path: "/", secure: true });
 }
 
 /**

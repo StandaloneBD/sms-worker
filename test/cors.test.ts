@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { app } from "../src/index";
 
 describe("CORS middleware", () => {
-  it("handles OPTIONS preflight requests and allows all origins, methods, and headers", async () => {
+  it("handles OPTIONS preflight requests and allows the API's methods and headers", async () => {
     const res = await app.request(
       "/health",
       {
@@ -21,8 +21,9 @@ describe("CORS middleware", () => {
     expect(res.headers.get("access-control-allow-origin")).toBe("*");
     expect(res.headers.get("access-control-allow-methods")).toContain("GET");
     expect(res.headers.get("access-control-allow-methods")).toContain("POST");
-    expect(res.headers.get("access-control-allow-methods")).toContain("OPTIONS");
-    expect(res.headers.get("access-control-allow-headers")).toBe("*");
+    expect(res.headers.get("access-control-allow-methods")).not.toContain("PATCH");
+    // Explicit list: a "*" wildcard would not cover Authorization.
+    expect(res.headers.get("access-control-allow-headers")).toBe("Authorization,Content-Type,Idempotency-Key");
     expect(res.headers.get("access-control-max-age")).toBe("86400");
   });
 
@@ -40,7 +41,7 @@ describe("CORS middleware", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("access-control-allow-origin")).toBe("*");
-    expect(res.headers.get("access-control-expose-headers")).toBe("*");
+    expect(res.headers.get("access-control-expose-headers")).toBe("Idempotent-Replayed");
   });
 
   it("handles preflight on /v1/sms/send without hitting auth middleware", async () => {

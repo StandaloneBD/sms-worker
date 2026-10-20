@@ -28,10 +28,20 @@ export function corsOriginFor(requestOrigin: string, configured: string | undefi
 // forms and has no business answering cross-origin requests.
 const apiCors = cors({
   origin: (origin, c) => corsOriginFor(origin, (c.env as Env | undefined)?.CORS_ORIGINS),
-  allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
-  allowHeaders: ["*"],
-  exposeHeaders: ["*"],
+  // Explicit lists: a "*" wildcard never covers Authorization, so browsers
+  // would fail the preflight of every authenticated call.
+  allowMethods: ["GET", "POST", "PUT", "DELETE"],
+  allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"],
+  exposeHeaders: ["Idempotent-Replayed"],
   maxAge: 86400,
+});
+// HSTS on every HTTPS response; the custom domain is HTTPS-only anyway, this
+// stops a browser from ever trying plain HTTP first.
+app.use("*", async (c, next) => {
+  await next();
+  if (new URL(c.req.url).protocol === "https:") {
+    c.header("Strict-Transport-Security", "max-age=31536000");
+  }
 });
 app.use("/v1/*", apiCors);
 app.use("/health", apiCors);

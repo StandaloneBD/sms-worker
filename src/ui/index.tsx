@@ -40,14 +40,37 @@ import { authMiddleware, csrfMiddleware } from "./session";
 
 export const adminRoutes = new Hono<AppEnv>({ strict: false });
 
+// Pages run no inline script (confirm prompts come from CONFIRM_SCRIPT);
+// inline styles stay allowed for the shell's <style> block and style attrs.
+const ADMIN_CSP = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+].join("; ");
+
+/** Asks before submitting any form carrying data-confirm. */
+const CONFIRM_SCRIPT = `document.addEventListener("submit", (event) => {
+  const message = event.target instanceof HTMLFormElement ? event.target.dataset.confirm : undefined;
+  if (message && !confirm(message)) event.preventDefault();
+});
+`;
+
 adminRoutes.use("*", async (c, next) => {
   c.header("Cache-Control", "no-store");
   c.header("X-Content-Type-Options", "nosniff");
   c.header("X-Frame-Options", "DENY");
   c.header("Referrer-Policy", "same-origin");
+  c.header("Content-Security-Policy", ADMIN_CSP);
   await next();
 });
 adminRoutes.use("*", requestBodyLimit(64 * 1024));
+
+adminRoutes.get("/confirm.js", (c) => c.body(CONFIRM_SCRIPT, 200, { "content-type": "text/javascript; charset=utf-8" }));
 
 // CSRF: applies to every route registered below, including /login.
 adminRoutes.use("*", csrfMiddleware);

@@ -21,6 +21,53 @@ function parseBearerToken(header: string | undefined): string | null {
   return token && token.length > 0 ? token : null;
 }
 
+/** Key hash → the verdict this isolate last confirmed is in KV. Lets the
+ *  request path skip KV entirely once the outage shield is known to be
+ *  current; bounded so a flood of distinct keys can't grow it unchecked. */
+const confirmedInCache = new Map<string, string>();
+const CONFIRMED_CACHE_MAX = 1000;
+
+function isAuthedApp(value: unknown): value is AuthedApp {
+  const v = value as AuthedApp | null;
+  return (
+    !!v &&
+    Number.isSafeInteger(v.id) &&
+    v.id > 0 &&
+    typeof v.name === "string" &&
+    typeof v.isActive === "boolean"
+  );
+}
+
+async function readAuthCache(env: Env, hash: string): Promise<AuthedApp | null> {
+  try {
+    const value = await env.CACHE.get<AuthedApp>(kvAppByKeyHash(hash), "json");
+    // Only trust a cache entry with the expected shape.
+    return isAuthedApp(value) ? value : null;
+  } catch (err) {
+    console.warn(
+      JSON.stringify({
+        event: "auth_cache_get_failed",
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  }
+}
+
+/** Brings the KV shield in line with D1, off the request path. Reads KV at
+ *  most once per key per isolate, and writes only when the entry is missing
+ *  or differs — KV writes must stay rare (Workers Free: 1,000/day). */
+async function syncAuthCache(env: Env, hash: string, authed: AuthedApp): Promise<void> {
+  const serialized = JSON.stringify(authed);
+  if (confirmedInCache.get(hash) === serialized) return;
+  const cached = await readAuthCache(env, hash);
+  if (!cached || JSON.stringify(cached) !== serialized) {
+    await writeAppAuthCache(env, hash, authed);
+  }
+  if (confirmedInCache.size >= CONFIRMED_CACHE_MAX) confirmedInCache.clear();
+  confirmedInCache.set(hash, serialized);
+}
+
 export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
   const token = parseBearerToken(c.req.header("authorization"));
   if (!token || !token.startsWith("sk_")) {
@@ -28,31 +75,6 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
   }
 
   const hash = await sha256Hex(token);
-  const cacheKey = kvAppByKeyHash(hash);
-
-  let cached: AuthedApp | null = null;
-  try {
-    const value = await c.env.CACHE.get<AuthedApp>(cacheKey, "json");
-    // Only trust a cache entry with the expected shape.
-    if (
-      value &&
-      Number.isSafeInteger(value.id) &&
-      value.id > 0 &&
-      typeof value.name === "string" &&
-      typeof value.isActive === "boolean"
-    ) {
-      cached = value;
-    }
-  } catch (err) {
-    // KV failures are swallowed — D1 is queried regardless, below.
-    console.warn(
-      JSON.stringify({
-        event: "auth_cache_get_failed",
-        error: err instanceof Error ? err.message : String(err),
-      }),
-    );
-    cached = null;
-  }
 
   let authed: AuthedApp | null;
   try {
@@ -62,15 +84,7 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
       return c.json({ error: "unauthorized" }, 401);
     }
     authed = { id: row.id, name: row.name, isActive: row.isActive, dailyQuota: row.dailyQuota };
-
-    // Refresh KV only when it's missing or stale so rotation/deactivation
-    // aren't undone by a write racing an already-correct cache. KV writes
-    // must stay rare (Workers Free: 1,000/day) — this keeps it to at most
-    // one per key per TTL window in the common case.
-    if (!cached || JSON.stringify(cached) !== JSON.stringify(authed)) {
-      const authedForCache = authed;
-      c.executionCtx.waitUntil(writeAppAuthCache(c.env, hash, authedForCache));
-    }
+    c.executionCtx.waitUntil(syncAuthCache(c.env, hash, authed));
   } catch (err) {
     // D1 unreachable: fall back to the warm cache (outage shield, ADR 0003).
     console.error(
@@ -79,10 +93,10 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
         error: err instanceof Error ? err.message : String(err),
       }),
     );
-    if (!cached) {
+    authed = await readAuthCache(c.env, hash);
+    if (!authed) {
       return c.json({ error: "service unavailable" }, 503);
     }
-    authed = cached;
   }
 
   if (!authed.isActive) {
