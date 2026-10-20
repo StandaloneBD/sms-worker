@@ -4,6 +4,8 @@ import type { Context } from "hono";
 import { getDb } from "../../db";
 import { updateAdminPassword } from "../../db/queries";
 import { hashPassword, verifyPassword } from "../../shared/crypto";
+import { MAX_PASSWORD_LENGTH } from "../../shared/constants";
+import { createSession } from "../session";
 import type { AppEnv } from "../../shared/types";
 import { Kv, Panel, PageHeader } from "../components";
 import { getAdminById } from "../data";
@@ -67,11 +69,11 @@ export async function settingsPost(c: Context<AppEnv>): Promise<Response> {
   const currentPassword = formRaw(body.currentPassword);
   const newPassword = formRaw(body.newPassword);
 
-  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+  if (newPassword.length < MIN_PASSWORD_LENGTH || newPassword.length > MAX_PASSWORD_LENGTH || currentPassword.length > MAX_PASSWORD_LENGTH) {
     return redirectFlash(
       c,
       adminPath("/settings"),
-      `New password must be at least ${MIN_PASSWORD_LENGTH} characters.`,
+      `Password must be ${MIN_PASSWORD_LENGTH}-${MAX_PASSWORD_LENGTH} characters.`,
       "error",
     );
   }
@@ -84,5 +86,6 @@ export async function settingsPost(c: Context<AppEnv>): Promise<Response> {
 
   const newHash = await hashPassword(newPassword);
   await updateAdminPassword(db, adminId, newHash);
+  await createSession(c, adminId, newHash);
   return redirectFlash(c, adminPath("/settings"), "Password updated.");
 }

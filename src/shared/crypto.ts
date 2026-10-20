@@ -3,11 +3,10 @@
  * runs on the Workers runtime's native SubtleCrypto/getRandomValues.
  */
 
-// Sized for the Workers FREE plan's 10ms CPU budget: 100k iterations sits at
-// the runtime's own ceiling and can blow that budget, making admin login fail
-// in production while passing in `wrangler dev` (which doesn't enforce the
-// kill). 40k keeps a few ms of headroom; raise on Workers Paid. Stored hashes
-// embed their iteration count, so changing this never breaks existing admins.
+// Preserve the existing password cost for the Workers Free CPU budget.
+// Local workerd checks do not enforce production CPU limits; benchmark login
+// and password changes before raising it. Stored hashes embed their iteration
+// count, so a future increase can still verify existing passwords.
 const PBKDF2_ITERATIONS = 40_000;
 const PBKDF2_SALT_BYTES = 16;
 const API_KEY_RANDOM_BYTES = 24; // -> 48 hex chars
@@ -54,8 +53,13 @@ function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
   }
 }
 
-export function timingSafeEqualStr(a: string, b: string): boolean {
-  return timingSafeEqualBytes(new TextEncoder().encode(a), new TextEncoder().encode(b));
+export async function timingSafeEqualStr(a: string, b: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [aHash, bHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(a)),
+    crypto.subtle.digest("SHA-256", encoder.encode(b)),
+  ]);
+  return crypto.subtle.timingSafeEqual(aHash, bHash);
 }
 
 /* ------------------------------------------------------------------ */
@@ -139,6 +143,7 @@ export async function verifyPassword(password: string, stored: string): Promise<
 /* ------------------------------------------------------------------ */
 
 async function getAesKey(env: Env): Promise<CryptoKey> {
+  if (!env.ENCRYPTION_KEY) throw new Error("ENCRYPTION_KEY is required");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.ENCRYPTION_KEY));
   return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
@@ -169,6 +174,7 @@ export async function decryptSecret(env: Env, ciphertext: string): Promise<strin
 /* ------------------------------------------------------------------ */
 
 async function getHmacKey(env: Env): Promise<CryptoKey> {
+  if (!env.SESSION_SECRET) throw new Error("SESSION_SECRET is required");
   return crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(env.SESSION_SECRET),
@@ -178,16 +184,17 @@ async function getHmacKey(env: Env): Promise<CryptoKey> {
   );
 }
 
-/** Format: `<adminId>.<exp>.<base64url(HMAC-SHA256(SESSION_SECRET, adminId + "." + exp))>`. */
-export async function signSession(env: Env, adminId: number, expiresAtEpochSeconds: number): Promise<string> {
+/** The HMAC includes the current password hash, so changing it revokes all
+ * previous sessions. Token format remains `<adminId>.<exp>.<signature>`. */
+export async function signSession(env: Env, adminId: number, expiresAtEpochSeconds: number, passwordHash: string): Promise<string> {
   const payload = `${adminId}.${expiresAtEpochSeconds}`;
   const key = await getHmacKey(env);
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${payload}.${passwordHash}`));
   return `${payload}.${toBase64Url(new Uint8Array(signature))}`;
 }
 
 /** Verifies the HMAC (timing-safe) and expiry, returning the admin id or null. */
-export async function verifySession(env: Env, token: string): Promise<number | null> {
+export async function verifySession(env: Env, token: string, passwordHash: string): Promise<number | null> {
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   const [adminIdStr, expStr, sig] = parts;
@@ -195,12 +202,12 @@ export async function verifySession(env: Env, token: string): Promise<number | n
 
   const adminId = Number(adminIdStr);
   const exp = Number(expStr);
-  if (!Number.isInteger(adminId) || !Number.isFinite(exp)) return null;
+  if (!Number.isSafeInteger(adminId) || adminId <= 0 || !Number.isSafeInteger(exp)) return null;
   if (Math.floor(Date.now() / 1000) >= exp) return null;
 
   const key = await getHmacKey(env);
-  const expectedSig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${adminIdStr}.${expStr}`));
+  const expectedSig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${adminIdStr}.${expStr}.${passwordHash}`));
   const expected = toBase64Url(new Uint8Array(expectedSig));
 
-  return timingSafeEqualStr(sig, expected) ? adminId : null;
+  return (await timingSafeEqualStr(sig, expected)) ? adminId : null;
 }

@@ -7,7 +7,9 @@ import { TEMPLATE_TOKEN_REGEX } from "../shared/constants";
  * CONTEXT.md "Template".
  */
 export function renderTemplate(body: string, vars: Record<string, string> | undefined): string {
-  return body.replace(TEMPLATE_TOKEN_REGEX, (_match, token: string) => vars?.[token] ?? "");
+  return body.replace(TEMPLATE_TOKEN_REGEX, (_match, token: string) =>
+    vars && Object.hasOwn(vars, token) ? vars[token] ?? "" : "",
+  );
 }
 
 /** Distinct token names referenced by a template body, in first-seen order. */

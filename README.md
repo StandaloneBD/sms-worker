@@ -19,13 +19,19 @@ Domain language: [CONTEXT.md](./CONTEXT.md). Key decisions:
   message is only `{jobId, chunkIndex}`; the payload lives in **R2**
   (ADR 0001). Failed chunks retry with exponential backoff, then dead-letter
   to `sms-dlq` where they're recorded as failed.
-- **KV** — cache for app auth + provider config, so sends survive a D1
-  outage (ADR 0002: sending outranks record-keeping).
+- **KV** — fallback cache for app auth + provider config. D1 is read first
+  when reachable; warm caches can keep plain-message sends available during
+  an outage (template lookup and bulk submission still require D1).
+- **Cron** — retries unfinished queue publication every minute, and purges
+  retained history and job payloads nightly. A bounded R2 scan also removes
+  orphan payloads older than 90 days while protecting active jobs.
 
 ## Setup
 
+Use Node.js 22 or newer for the Cloudflare tooling.
+
 ```sh
-npm install
+npm ci
 
 # 1. Create resources (once)
 npx wrangler d1 create sms-worker           # put database_id into wrangler.jsonc
@@ -51,6 +57,21 @@ npm run deploy               # deploys to sms.shihabmridha.com
 First admin login: username `admin` + the `ADMIN_BOOTSTRAP_PASSWORD` value
 (only works while no admin exists; change the password in Settings after).
 Register an App in the UI — the API key is shown exactly once.
+
+### Updating an existing installation
+
+Apply `drizzle/0002_delivery_recovery.sql` before deploying this version
+(`npm run db:migrate:remote`). It adds the durable queue publication marker
+and job-list/retention indexes. Existing job data is preserved; unfinished
+bulk jobs without a publication marker are recovered by the minute cron.
+Publishing again can duplicate in-flight chunks, consistent with the
+at-least-once delivery contract. Existing admin sessions require signing in
+again because signatures now include the current password hash.
+
+The D1 and KV identifiers in the checked-in config are placeholders: replace
+them with the actual resource identifiers before deployment. The login rate
+limiter namespace `3184762001` should be reserved for this Worker on the
+target account.
 
 ### 5. Provider credentials
 
@@ -96,7 +117,41 @@ to dispatch with that profile's sender identity/credentials.
 - `vars`: at most 20 keys per recipient, each value a string of at most 1,000
   characters.
 - An oversized body is rejected before it's read, as `413 {"error": "request
-  body too large"}`.
+  body too large"}` when Content-Length already exceeds the limit; otherwise
+  consumed bytes are counted and reading stops at the limit. Missing or
+  inaccurate length headers cannot bypass the cap. Recipient and byte limits
+  apply independently; rich `vars` can exceed the cap with fewer recipients.
+- Template/provider JSON mutations and admin form submissions: ≤ 64 KiB.
+- Bulk `202` means the job and every chunk are recorded durably in D1 and
+  its payload is stored in R2. If queue publication fails, the response
+  includes a warning and recovery retries pending chunks after roughly
+  1–2 minutes (up to 10 jobs per cron invocation). Poll the returned job ID;
+  a new submission creates a separate job.
+- An uncertain D1 write returns `503` with a `jobId`. Poll that ID before
+  resubmitting: the write may have committed, in which case cron recovery
+  publishes it. Its R2 payload is preserved until acceptance can be resolved
+  or orphan retention removes it.
+
+## Checks
+
+```sh
+npm run typecheck
+npm run typecheck:test
+npm test
+npx wrangler deploy --dry-run
+```
+
+Tests run in workerd with local D1/KV/R2 bindings, explicit fake SMS and
+test-only secrets. They cover the real migration chain, large job creation,
+partial queue publication, chunk accounting, provider responses, and admin
+session revocation. Local checks do not enforce production CPU budgets or
+verify provider accounts; no real SMS is sent by the test suite.
+
+The scoped esbuild override patches Drizzle Kit's deprecated
+`@esbuild-kit/core-utils` dependency. The sharp override patches Miniflare's
+image decoder dependency. Remove these overrides when the upstream tooling
+ships patched versions; migration generation and local Worker tests are
+checked with them in place.
 
 ## Notes
 
@@ -105,10 +160,19 @@ to dispatch with that profile's sender identity/credentials.
   "Dispatch".
 - Phone numbers: `^\+?[0-9]{11,14}$`, stored as given; MiMSMS 880-prefixing
   happens inside its adapter only.
-- Sizing constants (chunk 250, sync cap 100, job cap 50k) are tuned for
-  **Workers Free** limits — see `src/shared/constants.ts` before raising.
+- Statement batching (chunk 250, sync cap 100, job cap 50k) respects the
+  [Workers Free D1 query/parameter limits](https://developers.cloudflare.com/d1/platform/limits/). Production CPU/memory usage
+  still needs measurement, especially for large JSON jobs — see
+  `src/shared/constants.ts` before raising these caps.
 - API key rotation and app activate/deactivate take effect immediately (D1 is
   authoritative for auth — see ADR 0003). Global provider credential saves
   (ADR 0004) and per-app provider/masking changes made through the UI/API
-  invalidate app caches (KV) instantly; anything else refreshes within
-  5 minutes.
+  purge fallback app caches (KV) on a best-effort basis. Provider settings
+  also use D1-first reads, so warm stale KV cannot override healthy D1.
+  During D1 outages, cached auth/provider values can remain stale until
+  their 5-minute expiry; [KV mutations propagate eventually across locations](https://developers.cloudflare.com/kv/concepts/how-kv-works/).
+- [Admin login rate limiting](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) allows approximately 10 attempts/minute per connecting
+  IP per Cloudflare location. Changing a password revokes all older sessions
+  and renews the session making the change. Admin/API responses use
+  `Cache-Control: no-store`; provider response bodies are capped at 256 KiB
+  and both headers and body must arrive before the provider timeout.

@@ -15,11 +15,9 @@ export const MAX_SYNC_RECIPIENTS = 100;
 
 /**
  * Max accepted JSON body for a sync /sms/send request. Derived from the
- * worst legitimate shape: MAX_SYNC_RECIPIENTS (100) recipients, each up to
- * ~1 KB of message text (MAX_MESSAGE_LENGTH) plus its `to` string and a
- * bounded `vars` object (MAX_VARS_KEYS × MAX_VAR_VALUE_LENGTH) — comfortably
- * under 200 KiB with JSON overhead; 256 KiB leaves headroom without opening
- * the door to much larger inline payloads on the synchronous path.
+ * Typical sends fit under 256 KiB. Recipient count and byte count are
+ * independent limits: 100 recipients with 20 large variables each may
+ * exceed this cap and must be split or submitted as a bulk job.
  */
 export const MAX_SYNC_BODY_BYTES = 256 * 1024;
 
@@ -40,6 +38,7 @@ export const MAX_BODY_BYTES = 25 * 1024 * 1024;
 
 /** Message body length cap (matches acadion's contract). */
 export const MAX_MESSAGE_LENGTH = 1000;
+export const MAX_REASON_LENGTH = 500;
 
 /** Template name length cap. */
 export const MAX_TEMPLATE_NAME_LENGTH = 64;
@@ -81,3 +80,4 @@ export const r2JobKey = (jobId: string) => `jobs/${jobId}.json`;
 /** Session cookie name for the admin UI. */
 export const SESSION_COOKIE = "sms_admin_session";
 export const SESSION_TTL_SECONDS = 12 * 60 * 60;
+export const MAX_PASSWORD_LENGTH = 1024;

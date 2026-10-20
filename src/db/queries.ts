@@ -7,7 +7,7 @@
  * constants below.
  */
 
-import { and, asc, desc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import { HISTORY_INSERT_ROWS } from "../shared/constants";
@@ -35,7 +35,9 @@ const now = (): number => Math.floor(Date.now() / 1000);
  *  so walk it. */
 export function isUniqueConstraintError(err: unknown): boolean {
   for (let e: unknown = err; e instanceof Error; e = e.cause) {
-    if (e.message.toUpperCase().includes("UNIQUE")) return true;
+    // Drizzle's outer message includes SQL/parameters: an app named "Unique"
+    // must not turn an unrelated D1 outage into an apparent name conflict.
+    if (/^(?:D1_ERROR:\s*)?UNIQUE constraint failed:/i.test(e.message)) return true;
   }
   return false;
 }
@@ -127,21 +129,20 @@ export async function getGlobalProviders(db: Db) {
   return db.select().from(providerSettings).orderBy(asc(providerSettings.priority));
 }
 
-export async function upsertGlobalProvider(
-  db: Db,
-  input: {
-    provider: ProviderName;
-    enabled: boolean;
-    priority: number;
-    /** For each optional field: undefined = keep existing value, null = clear, string = set. */
-    senderId?: string | null;
-    username?: string | null;
-    senderName?: string | null;
-    apiKeyEnc?: string | null;
-  },
-) {
+export interface GlobalProviderInput {
+  provider: ProviderName;
+  enabled: boolean;
+  priority: number;
+  /** For each optional field: undefined = keep existing value, null = clear, string = set. */
+  senderId?: string | null;
+  username?: string | null;
+  senderName?: string | null;
+  apiKeyEnc?: string | null;
+}
+
+function globalProviderStatement(db: Db, input: GlobalProviderInput) {
   const ts = now();
-  const rows = await db
+  return db
     .insert(providerSettings)
     .values({
       provider: input.provider,
@@ -166,7 +167,16 @@ export async function upsertGlobalProvider(
       },
     })
     .returning();
+}
+
+export async function upsertGlobalProvider(db: Db, input: GlobalProviderInput) {
+  const rows = await globalProviderStatement(db, input);
   return firstOrThrow(rows, "upsertGlobalProvider");
+}
+
+export async function upsertGlobalProviders(db: Db, inputs: GlobalProviderInput[]): Promise<void> {
+  const [first, ...rest] = inputs.map((input) => globalProviderStatement(db, input));
+  if (first) await db.batch([first, ...rest]);
 }
 
 /**
@@ -212,6 +222,15 @@ export async function upsertAppProvider(
     })
     .returning();
   return firstOrThrow(rows, "upsertAppProvider");
+}
+
+export async function upsertAppProviders(
+  db: Db,
+  inputs: { appId: number; provider: ProviderName; enabled: boolean; priority: number }[],
+): Promise<void> {
+  const [first, ...rest] = inputs.map((input) => db.insert(appProviders).values(input)
+    .onConflictDoUpdate({ target: [appProviders.appId, appProviders.provider], set: { enabled: input.enabled, priority: input.priority } }));
+  if (first) await db.batch([first, ...rest]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -320,7 +339,7 @@ export async function listTemplates(db: Db, appId: number) {
 
 export type NewJobInput = Omit<
   typeof jobs.$inferInsert,
-  "createdAt" | "sent" | "failed" | "chunksDone" | "completedAt" | "error"
+  "createdAt" | "sent" | "failed" | "chunksDone" | "completedAt" | "enqueuedAt" | "error"
 >;
 
 export async function insertJob(db: Db, job: NewJobInput) {
@@ -331,23 +350,59 @@ export async function insertJob(db: Db, job: NewJobInput) {
   return firstOrThrow(rows, "insertJob");
 }
 
-/** 2 bound params/row (jobId, chunkIndex); 50 rows/statement stays at the 100-param D1 cap. */
-const JOB_CHUNK_INSERT_ROWS = 50;
+/** Drizzle binds status/sent/failed defaults too: 5 params/row, 20 rows = 100. */
+const JOB_CHUNK_INSERT_ROWS = 20;
 const MAX_STATEMENTS_PER_BATCH = 20;
 
-export async function insertJobChunks(db: Db, jobId: string, chunkCount: number): Promise<void> {
-  if (chunkCount <= 0) return;
+function jobChunkStatements(db: Db, jobId: string, chunkCount: number) {
   const indexes = Array.from({ length: chunkCount }, (_, i) => i);
   const rowGroups = chunkArray(indexes, JOB_CHUNK_INSERT_ROWS);
-  const statements = rowGroups.map((group) =>
+  return rowGroups.map((group) =>
     db.insert(jobChunks).values(group.map((chunkIndex) => ({ jobId, chunkIndex }))),
   );
-  await runBatched(db, statements, MAX_STATEMENTS_PER_BATCH);
+}
+
+export async function insertJobChunks(db: Db, jobId: string, chunkCount: number): Promise<void> {
+  await runBatched(db, jobChunkStatements(db, jobId, chunkCount), MAX_STATEMENTS_PER_BATCH);
+}
+
+/** Record the job and ALL chunks together. A 50k-recipient job is 11 statements. */
+export async function insertJobWithChunks(db: Db, job: NewJobInput): Promise<void> {
+  await db.batch([
+    db.insert(jobs).values({ ...job, createdAt: now() }),
+    ...jobChunkStatements(db, job.id, job.chunkCount ?? 0),
+  ]);
+}
+
+export async function pendingChunkIndexes(db: Db, jobId: string): Promise<number[]> {
+  const rows = await db.select({ index: jobChunks.chunkIndex }).from(jobChunks)
+    .where(and(eq(jobChunks.jobId, jobId), eq(jobChunks.status, "pending")))
+    .orderBy(asc(jobChunks.chunkIndex));
+  return rows.map((row) => row.index);
+}
+
+export async function markJobEnqueued(db: Db, jobId: string): Promise<void> {
+  await db.update(jobs).set({ enqueuedAt: now() }).where(eq(jobs.id, jobId));
+}
+
+export async function jobsAwaitingEnqueue(db: Db, before: number, limit = 10) {
+  return db.select({ id: jobs.id }).from(jobs)
+    .where(and(eq(jobs.kind, "bulk"), isNull(jobs.enqueuedAt), isNull(jobs.completedAt), lt(jobs.createdAt, before)))
+    .orderBy(asc(jobs.createdAt)).limit(limit);
 }
 
 export async function getJob(db: Db, id: string) {
   const rows = await db.select().from(jobs).where(eq(jobs.id, id)).limit(1);
   return rows[0];
+}
+
+export async function existingJobIds(db: Db, ids: string[]): Promise<Set<string>> {
+  const existing = new Set<string>();
+  for (const slice of chunkArray(ids, 90)) {
+    const rows = await db.select({ id: jobs.id }).from(jobs).where(inArray(jobs.id, slice));
+    for (const row of rows) existing.add(row.id);
+  }
+  return existing;
 }
 
 export async function getJobForApp(db: Db, appId: number, id: string) {
@@ -365,7 +420,7 @@ export async function listJobs(db: Db, opts: { appId?: number; limit: number; of
     .select()
     .from(jobs)
     .where(where)
-    .orderBy(desc(jobs.createdAt))
+    .orderBy(desc(jobs.createdAt), desc(jobs.id))
     .limit(opts.limit)
     .offset(opts.offset);
 }
@@ -426,8 +481,8 @@ export async function completeChunk(
         sent: sentSum,
         failed: failedSum,
         chunksDone: doneCount,
-        status: sql`CASE WHEN ${doneCount} >= ${jobs.chunkCount} THEN CASE WHEN ${failedSum} > 0 THEN 'completed_with_errors' ELSE 'completed' END ELSE ${jobs.status} END`,
-        completedAt: sql`CASE WHEN ${doneCount} >= ${jobs.chunkCount} THEN ${ts} ELSE ${jobs.completedAt} END`,
+        status: sql`CASE WHEN ${jobs.status} = 'failed' THEN 'failed' WHEN ${doneCount} >= ${jobs.chunkCount} THEN CASE WHEN ${failedSum} > 0 THEN 'completed_with_errors' ELSE 'completed' END ELSE ${jobs.status} END`,
+        completedAt: sql`CASE WHEN ${jobs.completedAt} IS NOT NULL THEN ${jobs.completedAt} WHEN ${doneCount} >= ${jobs.chunkCount} THEN ${ts} ELSE NULL END`,
       })
       .where(eq(jobs.id, input.jobId)),
   ]);
@@ -538,6 +593,7 @@ export async function updateAdminPassword(db: Db, id: number, passwordHash: stri
 export async function purgeOlderThan(
   db: Db,
   days: number,
+  cleanupPayloads?: (jobIds: string[]) => Promise<void>,
 ): Promise<{ messages: number; jobChunks: number; jobs: number }> {
   const cutoff = now() - days * 86400;
 
@@ -556,9 +612,14 @@ export async function purgeOlderThan(
   let jobChunksDeleted = 0;
   let jobsDeleted = 0;
   for (const idSlice of chunkArray(staleJobIds, 90)) {
-    const chunksResult = await db.delete(jobChunks).where(inArray(jobChunks.jobId, idSlice));
+    // Clean R2 while D1 still retains the keys. A failure leaves the rows
+    // discoverable for the next retention run.
+    await cleanupPayloads?.(idSlice);
+    const [chunksResult, jobsResult] = await db.batch([
+      db.delete(jobChunks).where(inArray(jobChunks.jobId, idSlice)),
+      db.delete(jobs).where(inArray(jobs.id, idSlice)),
+    ]);
     jobChunksDeleted += chunksResult.meta.changes;
-    const jobsResult = await db.delete(jobs).where(inArray(jobs.id, idSlice));
     jobsDeleted += jobsResult.meta.changes;
   }
 

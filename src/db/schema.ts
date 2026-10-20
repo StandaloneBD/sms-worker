@@ -105,7 +105,14 @@ export const jobs = sqliteTable("jobs", {
   error: text("error"),
   createdAt: int("created_at").notNull(),
   completedAt: int("completed_at"),
-});
+  /** Durable publication marker; null jobs are retried by the minute cron. */
+  enqueuedAt: int("enqueued_at"),
+}, (t) => [
+  index("jobs_created_idx").on(t.createdAt, t.id),
+  index("jobs_app_created_idx").on(t.appId, t.createdAt, t.id),
+  index("jobs_completed_idx").on(t.completedAt),
+  index("jobs_enqueue_idx").on(t.enqueuedAt, t.createdAt),
+]);
 
 export const jobChunks = sqliteTable(
   "job_chunks",

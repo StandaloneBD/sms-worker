@@ -12,6 +12,7 @@
  */
 
 import { Hono } from "hono";
+import { requestBodyLimit } from "../shared/body-limit";
 import type { AppEnv } from "../shared/types";
 import { NotFoundPage } from "./components";
 import { readFlash } from "./flash";
@@ -37,6 +38,15 @@ import { templateEditGet, templateEditPost } from "./pages/templates";
 import { authMiddleware, csrfMiddleware } from "./session";
 
 export const adminRoutes = new Hono<AppEnv>({ strict: false });
+
+adminRoutes.use("*", async (c, next) => {
+  c.header("Cache-Control", "no-store");
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "same-origin");
+  await next();
+});
+adminRoutes.use("*", requestBodyLimit(64 * 1024));
 
 // CSRF: applies to every route registered below, including /login.
 adminRoutes.use("*", csrfMiddleware);

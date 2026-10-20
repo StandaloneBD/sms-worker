@@ -26,10 +26,8 @@ import {
 import { buildDispatchPlan } from "../core/plan";
 import { dispatch } from "../sms/dispatch";
 import { renderTemplate } from "../sms/template";
-import { CHUNK_SIZE, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, r2JobKey } from "../shared/constants";
+import { CHUNK_SIZE, MAX_REASON_LENGTH, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, r2JobKey } from "../shared/constants";
 import type { ChunkQueueMessage, DispatchInput, DispatchResultItem, JobPayload, JobRecipient } from "../shared/types";
-
-const MAX_REASON_LENGTH = 500;
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -56,9 +54,15 @@ function isChunkQueueMessage(value: unknown): value is ChunkQueueMessage {
     typeof record.jobId === "string" &&
     record.jobId.length > 0 &&
     typeof record.chunkIndex === "number" &&
-    Number.isInteger(record.chunkIndex) &&
+    Number.isSafeInteger(record.chunkIndex) &&
     record.chunkIndex >= 0
   );
+}
+
+function assertPayloadMatchesJob(payload: JobPayload, job: NonNullable<Awaited<ReturnType<typeof getJob>>>): void {
+  if (!payload || payload.jobId !== job.id || payload.appId !== job.appId || payload.chunkSize !== CHUNK_SIZE || !Array.isArray(payload.recipients) || payload.recipients.length !== job.total) {
+    throw new Error("job payload does not match its recorded job");
+  }
 }
 
 export async function handleQueue(
@@ -128,11 +132,17 @@ async function processJobMessage(msg: Message<unknown>, env: Env, db: Db): Promi
   }
   const { jobId, chunkIndex } = msg.body;
 
+  const job = await getJob(db, jobId);
+  if (!job || job.status === "failed") {
+    msg.ack();
+    return;
+  }
+
   // (b) Pre-send skip check.
   const chunk = await getJobChunk(db, jobId, chunkIndex);
   if (!chunk) {
-    // Producer bookkeeping (insertJobChunks) may not have landed yet when the
-    // queue message is delivered — retry, don't poison.
+    // Job/chunk creation is atomic. Missing bookkeeping is an invariant
+    // failure; retry infrastructure errors and let the DLQ account for it.
     console.error(
       JSON.stringify({ event: "chunk_row_missing", ts: nowSeconds(), jobId, chunkIndex, attempts: msg.attempts }),
     );
@@ -143,6 +153,7 @@ async function processJobMessage(msg: Message<unknown>, env: Env, db: Db): Promi
     console.log(
       JSON.stringify({ event: "chunk_already_handled", ts: nowSeconds(), jobId, chunkIndex, status: chunk.status }),
     );
+    await cleanupPayloadIfComplete(db, env, jobId);
     msg.ack();
     return;
   }
@@ -167,6 +178,7 @@ async function processJobMessage(msg: Message<unknown>, env: Env, db: Db): Promi
     return;
   }
   const payload = await object.json<JobPayload>();
+  assertPayloadMatchesJob(payload, job);
 
   // (e) Slice + resolve bodies.
   const start = chunkIndex * payload.chunkSize;
@@ -190,13 +202,14 @@ async function processJobMessage(msg: Message<unknown>, env: Env, db: Db): Promi
           }
         : { kind: "dynamic", messages: dispatchable.map((r) => ({ to: r.to, message: r.body })) };
     const plan = await buildDispatchPlan(env, db, payload.appId, payload.maskingProfile);
+    if (plan.warnings.length > 0) console.warn(JSON.stringify({ event: "chunk_plan_warnings", jobId, chunkIndex, warnings: plan.warnings }));
     dispatchResults = await dispatch(plan.entries, input);
   }
 
   // (g) Idempotency gate + counter rollup, atomically, AFTER the send —
   // never before (ADR 0002). If this throws, nothing was committed: the
   // outer catch retries and redelivery re-sends (duplicates over loss).
-  const { rows, sent, failed } = buildHistoryRows(payload.appId, jobId, resolved, dispatchResults);
+  const { rows, sent, failed } = buildHistoryRows(payload.appId, jobId, resolved, dispatchResults, payload.templateBody !== undefined);
   const claimed = await completeChunk(db, { jobId, chunkIndex, sent, failed });
   if (!claimed) {
     console.warn(
@@ -272,6 +285,7 @@ function buildHistoryRows(
   jobId: string,
   resolved: ResolvedRecipient[],
   dispatchResults: DispatchResultItem[],
+  hasTemplate: boolean,
 ): { rows: NewMessageRow[]; sent: number; failed: number } {
   const rows: NewMessageRow[] = [];
   let sent = 0;
@@ -310,7 +324,7 @@ function buildHistoryRows(
       jobId,
       appId,
       recipient: r.to,
-      body: r.isExplicitOverride ? r.body : null,
+      body: r.isExplicitOverride || hasTemplate ? r.body : null,
       provider: outcome.provider,
       status: outcome.accepted ? "sent" : "failed",
       reason: outcome.reason ? truncateReason(outcome.reason) : null,
@@ -333,6 +347,12 @@ async function processDlqMessage(msg: Message<unknown>, env: Env, db: Db): Promi
   }
   const { jobId, chunkIndex } = msg.body;
 
+  const job = await getJob(db, jobId);
+  if (!job || job.status === "failed") {
+    msg.ack();
+    return;
+  }
+
   const chunk = await getJobChunk(db, jobId, chunkIndex);
   if (!chunk || chunk.status !== "pending") {
     console.log(
@@ -344,13 +364,25 @@ async function processDlqMessage(msg: Message<unknown>, env: Env, db: Db): Promi
         status: chunk?.status ?? "missing",
       }),
     );
+    await cleanupPayloadIfComplete(db, env, jobId);
     msg.ack();
     return;
   }
 
   const object = await env.PAYLOADS.get(r2JobKey(jobId));
+  let payload: JobPayload | undefined;
   if (object) {
-    const payload = await object.json<JobPayload>();
+    try {
+      const parsed = await object.json<JobPayload>();
+      assertPayloadMatchesJob(parsed, job);
+      payload = parsed;
+    } catch (err) {
+      // A permanently corrupt body must not exhaust the DLQ's retries and
+      // leave job counters pending forever. Recover counts from D1 below.
+      console.error(JSON.stringify({ event: "dlq_payload_invalid", jobId, chunkIndex, error: errorMessage(err) }));
+    }
+  }
+  if (payload) {
     const start = chunkIndex * payload.chunkSize;
     const recipients = payload.recipients.slice(start, start + payload.chunkSize);
 
@@ -364,16 +396,19 @@ async function processDlqMessage(msg: Message<unknown>, env: Env, db: Db): Promi
       return;
     }
 
-    const rows: NewMessageRow[] = recipients.map((r) => ({
-      jobId,
-      appId: payload.appId,
-      recipient: r.to,
-      body: null,
-      provider: null,
-      status: "failed",
-      reason: "dead-lettered after retries exhausted",
-      trackingId: null,
-    }));
+    const rows: NewMessageRow[] = recipients.map((r) => {
+      const resolved = resolveRecipient(payload, r);
+      return {
+        jobId,
+        appId: payload.appId,
+        recipient: r.to,
+        body: resolved.kind === "send" && (resolved.isExplicitOverride || payload.templateBody !== undefined) ? resolved.body : null,
+        provider: null,
+        status: "failed",
+        reason: "dead-lettered after retries exhausted",
+        trackingId: null,
+      };
+    });
     // Best-effort per-recipient rows (counters already committed above).
     try {
       await insertMessages(db, rows);
@@ -391,13 +426,6 @@ async function processDlqMessage(msg: Message<unknown>, env: Env, db: Db): Promi
   // Recover counts from the jobs row: CHUNK_SIZE is the fixed sizing
   // constant every producer slices with (see shared/constants) — the jobs
   // table itself has no per-job chunkSize column, only `total`.
-  const job = await getJob(db, jobId);
-  if (!job) {
-    console.error(JSON.stringify({ event: "dlq_job_missing", ts: nowSeconds(), jobId, chunkIndex }));
-    msg.ack();
-    return;
-  }
-
   const remaining = job.total - chunkIndex * CHUNK_SIZE;
   const failed = Math.max(0, Math.min(CHUNK_SIZE, remaining));
   const claimed = await completeChunk(db, { jobId, chunkIndex, sent: 0, failed });
@@ -415,5 +443,6 @@ async function processDlqMessage(msg: Message<unknown>, env: Env, db: Db): Promi
       failed,
     }),
   );
+  await cleanupPayloadIfComplete(db, env, jobId);
   msg.ack();
 }

@@ -6,6 +6,7 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
+import { MAX_REASON_LENGTH } from "../shared/constants";
 
 /**
  * Ported from acadion's SmsService.ts (the provider-failover composite),
@@ -51,7 +52,7 @@ export async function dispatch(
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       for (const index of pending) {
-        reasons[index]?.push(reason);
+        reasons[index]?.push(reason.slice(0, MAX_REASON_LENGTH));
       }
       continue;
     }
@@ -72,7 +73,7 @@ export async function dispatch(
         acceptedBy[index] = entry.provider.name;
         continue;
       }
-      reasons[index]?.push(outcome.reason ?? "provider declined");
+      reasons[index]?.push((outcome.reason ?? "provider declined").slice(0, MAX_REASON_LENGTH));
       stillPending.push(index);
     }
     pending = stillPending;
@@ -92,7 +93,7 @@ export async function dispatch(
       provider: null,
       reason:
         failures.length > 0
-          ? `All SMS providers failed: ${failures.join("; ")}`
+          ? `All SMS providers failed: ${failures.join("; ")}`.slice(0, MAX_REASON_LENGTH)
           : "No SMS providers configured",
     };
   });

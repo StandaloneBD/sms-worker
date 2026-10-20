@@ -2,7 +2,7 @@
 
 import type { Context } from "hono";
 import { getDb } from "../../db";
-import { upsertGlobalProvider } from "../../db/queries";
+import { upsertGlobalProviders } from "../../db/queries";
 import { invalidateAllAppConfigs } from "../../core/plan";
 import { encryptSecret } from "../../shared/crypto";
 import { PROVIDER_NAMES } from "../../shared/types";
@@ -12,7 +12,7 @@ import { getGlobalProviderRows } from "../data";
 import { redirectFlash, readFlash } from "../flash";
 import { Layout } from "../layout";
 import { adminPath } from "../paths";
-import { formChecked, formStr, formatTs, parseIntOr } from "../util";
+import { formChecked, formStr, formatTs, parseIntOr, providerCredentialError } from "../util";
 
 const PROVIDER_LABELS: Record<ProviderName, string> = {
   bulksmsbd: "BulkSMSBD",
@@ -166,18 +166,20 @@ export async function providersPost(c: Context<AppEnv>): Promise<Response> {
   // a rejected key on one provider never leaves the other half-saved.
   for (const provider of PROVIDER_NAMES) {
     const enabled = formChecked(body[`${provider}_enabled`]);
-    const priority = parseIntOr(formStr(body[`${provider}_priority`]), 100);
+    const priority = parseIntOr(formStr(body[`${provider}_priority`]), 0);
+    if (priority < 1) return redirectFlash(c, adminPath("/providers"), "Priority must be a positive integer.", "error");
     const senderIdRaw = formStr(body[`${provider}_senderId`]);
     const usernameRaw = formStr(body[`${provider}_username`]);
     const senderNameRaw = formStr(body[`${provider}_senderName`]);
     const apiKeyRaw = formStr(body[`${provider}_apiKey`]);
     const clearApiKey = formChecked(body[`${provider}_clearApiKey`]);
 
-    if (apiKeyRaw.length > 512 || /\s/.test(apiKeyRaw)) {
+    const credentialError = providerCredentialError({ apiKey: apiKeyRaw, senderId: senderIdRaw, senderName: senderNameRaw, username: usernameRaw });
+    if (credentialError) {
       return redirectFlash(
         c,
         adminPath("/providers"),
-        "API key must be at most 512 characters and contain no whitespace.",
+        credentialError,
         "error",
       );
     }
@@ -195,9 +197,7 @@ export async function providersPost(c: Context<AppEnv>): Promise<Response> {
     });
   }
 
-  for (const input of parsed) {
-    await upsertGlobalProvider(db, input);
-  }
+  await upsertGlobalProviders(db, parsed);
 
   await invalidateAllAppConfigs(c.env);
   return redirectFlash(c, adminPath("/providers"), "Global provider settings saved.");

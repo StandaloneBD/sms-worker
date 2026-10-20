@@ -4,7 +4,7 @@ import type {
   SmsDynamicMessage,
   SmsSendOutcome,
 } from "../shared/types";
-import { ProviderTransportError } from "./errors";
+import { postProviderJson } from "./http";
 
 const ONE_TO_MANY_URL = "https://api.mimsms.com/api/V2/OneToMany";
 const DYNAMIC_SMS_URL = "https://api.mimsms.com/api/V2/DSMS";
@@ -40,10 +40,6 @@ const MAX_RECIPIENTS_PER_REQUEST = 1000;
  */
 const TRANSACTION_TYPE = "T";
 
-function isAbortError(err: unknown): boolean {
-  return typeof err === "object" && err !== null && "name" in err && err.name === "AbortError";
-}
-
 /**
  * MiMSMS only accepts E.164-without-plus.
  *
@@ -63,7 +59,7 @@ function toInternational(number: string): string {
 }
 
 /**
- * Comparison key for a recipient: digits only, last ten.
+ * Comparison key for a recipient: the full international number.
  *
  * Requests are normalized above, but the reply is matched by number rather than
  * by position, so this keeps attribution working whatever form MiMSMS chooses to
@@ -71,13 +67,8 @@ function toInternational(number: string): string {
  * recipient of an otherwise successful batch.
  */
 function recipientKey(number: string): string {
-  return number.replace(/\D/g, "").slice(-10);
+  return toInternational(number);
 }
-
-type MimSmsSuccessEntry = {
-  mobNumber?: string;
-  trackingId?: string;
-};
 
 /**
  * Every published MiMSMS example returns `error_Data: []`, so the element shape
@@ -85,38 +76,21 @@ type MimSmsSuccessEntry = {
  * defensive: an entry we cannot read is still accounted for as a failure, and
  * never crashes the dispatch.
  */
-type MimSmsErrorEntry =
-  | string
-  | {
-      mobNumber?: string;
-      mobileNumber?: string;
-      number?: string;
-      to?: string;
-      errorMessage?: string;
-      responseResult?: string;
-      reason?: string;
-      message?: string;
-      status?: string;
-    };
-
 /** Best-effort `{ number, reason }` from an `error_Data` element of unknown shape. */
-function readErrorEntry(entry: MimSmsErrorEntry): { number: string; reason: string } | null {
+function readErrorEntry(entry: unknown): { number: string; reason: string } | null {
   if (typeof entry === "string") {
     return { number: entry, reason: "provider rejected recipient" };
   }
   if (entry === null || typeof entry !== "object") return null;
 
-  const number = entry.mobNumber ?? entry.mobileNumber ?? entry.number ?? entry.to;
+  const obj = entry as Record<string, unknown>;
+  const number = [obj.mobNumber, obj.mobileNumber, obj.number, obj.to].find((v): v is string => typeof v === "string" && v.length > 0);
   if (!number) return null;
 
   return {
     number,
     reason:
-      entry.errorMessage ??
-      entry.reason ??
-      entry.responseResult ??
-      entry.message ??
-      entry.status ??
+      [obj.errorMessage, obj.reason, obj.responseResult, obj.message, obj.status].find((v): v is string => typeof v === "string") ??
       "provider rejected recipient",
   };
 }
@@ -126,8 +100,8 @@ type MimSmsResponse = {
   status?: string;
   trxnId?: string;
   responseResult?: string;
-  success_Data?: MimSmsSuccessEntry[];
-  error_Data?: MimSmsErrorEntry[];
+  success_Data?: unknown[];
+  error_Data?: unknown[];
 };
 
 /** Ported from acadion's MimSms.ts. */
@@ -280,11 +254,15 @@ export class MimSms implements ISmsProvider {
     // held in a per-number FIFO rather than overwritten.
     const trackingIds = new Map<string, string[]>();
     for (const entry of Array.isArray(body.success_Data) ? body.success_Data : []) {
-      const key = recipientKey(entry?.mobNumber ?? "");
+      if (!entry || typeof entry !== "object") continue;
+      const obj = entry as Record<string, unknown>;
+      if (typeof obj.mobNumber !== "string") continue;
+      const key = recipientKey(obj.mobNumber);
       if (!key) continue;
+      const trackingId = typeof obj.trackingId === "string" ? obj.trackingId : "";
       const queue = trackingIds.get(key);
-      if (queue) queue.push(entry.trackingId ?? "");
-      else trackingIds.set(key, [entry.trackingId ?? ""]);
+      if (queue) queue.push(trackingId);
+      else trackingIds.set(key, [trackingId]);
     }
 
     const errorEntries = Array.isArray(body.error_Data) ? body.error_Data : [];
@@ -324,15 +302,14 @@ export class MimSms implements ISmsProvider {
     const outcomes = numbers.map((number): SmsSendOutcome => {
       const key = recipientKey(number);
 
+      const successes = trackingIds.get(key);
+      if (successes && successes.length > 0) {
+        return { accepted: true, trackingId: successes.shift() || undefined };
+      }
+
       const failureReason = errorReasons.get(key);
       if (failureReason !== undefined) {
         return { accepted: false, reason: failureReason };
-      }
-
-      if (trackingIds.has(key)) {
-        // `has` is checked before shifting, so a third occurrence of a
-        // twice-reported number still counts as accepted, just without an id.
-        return { accepted: true, trackingId: trackingIds.get(key)?.shift() || undefined };
       }
 
       unreported += 1;
@@ -363,41 +340,14 @@ export class MimSms implements ISmsProvider {
   }
 
   private async post(url: string, payload: unknown, timeoutMs: number): Promise<MimSmsResponse> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if (isAbortError(err)) {
-        throw new ProviderTransportError("MimSms request timed out");
-      }
-      if (err instanceof ProviderTransportError) {
-        throw err;
-      }
-      throw new ProviderTransportError(
-        `MimSms request failed: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err },
-      );
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (!response.ok) {
-      throw new ProviderTransportError(`MimSms request failed with status ${response.status}`);
-    }
-
-    try {
-      return (await response.json()) as MimSmsResponse;
-    } catch (err) {
-      throw new ProviderTransportError(
-        `MimSms response body could not be parsed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    const raw = await postProviderJson("MimSms", url, JSON.stringify(payload), { "Content-Type": "application/json", Accept: "application/json" }, timeoutMs);
+    return {
+      statusCode: typeof raw.statusCode === "string" || typeof raw.statusCode === "number" ? raw.statusCode : undefined,
+      status: typeof raw.status === "string" ? raw.status : undefined,
+      trxnId: typeof raw.trxnId === "string" ? raw.trxnId : undefined,
+      responseResult: typeof raw.responseResult === "string" ? raw.responseResult : undefined,
+      success_Data: Array.isArray(raw.success_Data) ? raw.success_Data : undefined,
+      error_Data: Array.isArray(raw.error_Data) ? raw.error_Data : undefined,
+    };
   }
 }

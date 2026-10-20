@@ -1,12 +1,14 @@
 /**
- * Cron trigger (wrangler.jsonc: "0 21 * * *") — nightly history retention
- * purge. Never throws: a purge failure is a structured log, not a worker
- * error (there is no caller to retry against).
+ * Minute cron: recover durable jobs whose queue publication did not finish.
+ * Nightly cron ("0 21 * * *"): purge history and the corresponding R2 data.
+ * Failures are logged; persisted state remains available to the next run.
  */
 
 import { getDb } from "../db";
 import { purgeOlderThan } from "../db/queries";
-import { RETENTION_DAYS } from "../shared/constants";
+import { RETENTION_DAYS, r2JobKey } from "../shared/constants";
+import { recoverUnpublishedJobs } from "./producer";
+import { purgeOrphanedPayloads } from "./retention";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -19,7 +21,12 @@ export async function handleScheduled(
 ): Promise<void> {
   try {
     const db = getDb(env);
-    const deleted = await purgeOlderThan(db, RETENTION_DAYS);
+    if (controller.cron !== "0 21 * * *") {
+      await recoverUnpublishedJobs(env, db);
+      return;
+    }
+    const deleted = await purgeOlderThan(db, RETENTION_DAYS, (ids) => env.PAYLOADS.delete(ids.map(r2JobKey)));
+    const deletedOrphans = await purgeOrphanedPayloads(env, db);
     console.log(
       JSON.stringify({
         event: "retention_purge_completed",
@@ -29,6 +36,7 @@ export async function handleScheduled(
         deletedMessages: deleted.messages,
         deletedJobChunks: deleted.jobChunks,
         deletedJobs: deleted.jobs,
+        deletedOrphanedPayloads: deletedOrphans,
       }),
     );
   } catch (err) {

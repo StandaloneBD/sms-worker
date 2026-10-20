@@ -18,7 +18,7 @@ import {
   listTemplates,
   rotateAppKey,
   setAppActive,
-  upsertAppProvider,
+  upsertAppProviders,
 } from "../../db/queries";
 import { invalidateAppConfig } from "../../core/plan";
 import { invalidateAppAuthCache, writeAppAuthCache } from "../../core/auth-cache";
@@ -32,7 +32,7 @@ import { redirectFlash, readFlash } from "../flash";
 import type { Flash } from "../flash";
 import { Layout } from "../layout";
 import { adminPath } from "../paths";
-import { formChecked, formatTs, formStr, parseId, parseIntOr } from "../util";
+import { formChecked, formatTs, formStr, parseId, parseIntOr, providerCredentialError } from "../util";
 
 const PROVIDER_LABELS: Record<ProviderName, string> = {
   bulksmsbd: "BulkSMSBD",
@@ -136,7 +136,8 @@ export async function appsCreatePost(c: Context<AppEnv>): Promise<Response> {
   let app: { id: number; name: string };
   try {
     app = await createApp(db, { name, keyHash: generated.hash, keyPrefix: generated.prefix });
-  } catch {
+  } catch (err) {
+    if (!isUniqueConstraintError(err)) throw err;
     return redirectFlash(c, adminPath("/apps"), `An app named "${name}" already exists.`, "error");
   }
 
@@ -487,11 +488,13 @@ export async function appProvidersPost(c: Context<AppEnv>): Promise<Response> {
   if (!app) return notFoundOrRedirect(c);
 
   const body = await c.req.parseBody();
-  for (const provider of PROVIDER_NAMES) {
+  const inputs = PROVIDER_NAMES.map((provider) => {
     const enabled = formChecked(body[`${provider}_enabled`]);
-    const priority = parseIntOr(formStr(body[`${provider}_priority`]), 100);
-    await upsertAppProvider(db, { appId: id, provider, enabled, priority });
-  }
+    const priority = parseIntOr(formStr(body[`${provider}_priority`]), 0);
+    return { appId: id, provider, enabled, priority };
+  });
+  if (inputs.some((row) => row.priority < 1)) return redirectFlash(c, adminPath(`/apps/${id}`), "Priority must be a positive integer.", "error");
+  await upsertAppProviders(db, inputs);
   await invalidateAppConfig(c.env, id);
 
   return redirectFlash(c, adminPath(`/apps/${id}`), "Provider plan saved.");
@@ -518,6 +521,8 @@ export async function appMaskingCreatePost(c: Context<AppEnv>): Promise<Response
   if (label.length < 1 || label.length > 32) {
     return redirectFlash(c, adminPath(`/apps/${id}`), "Label must be 1-32 characters.", "error");
   }
+  const credentialError = providerCredentialError({ apiKey, senderId, senderName, username });
+  if (credentialError) return redirectFlash(c, adminPath(`/apps/${id}`), credentialError, "error");
 
   const apiKeyEnc = apiKey ? await encryptSecret(c.env, apiKey) : null;
 
@@ -531,7 +536,8 @@ export async function appMaskingCreatePost(c: Context<AppEnv>): Promise<Response
       username: username || null,
       apiKeyEnc,
     });
-  } catch {
+  } catch (err) {
+    if (!isUniqueConstraintError(err)) throw err;
     return redirectFlash(
       c,
       adminPath(`/apps/${id}`),

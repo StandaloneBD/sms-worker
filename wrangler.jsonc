@@ -6,7 +6,8 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 0.5
+    "head_sampling_rate": 0.5,
+    "traces": { "enabled": true, "head_sampling_rate": 0.1 }
   },
   // Custom domain; the zone must exist on this Cloudflare account.
   "routes": [{ "pattern": "sms.shihabmridha.com", "custom_domain": true }],
@@ -14,6 +15,9 @@
   "vars": {
     "FAKE_SMS": "false"
   },
+  "ratelimits": [
+    { "name": "LOGIN_RATE_LIMIT", "namespace_id": "3184762001", "simple": { "limit": 10, "period": 60 } }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
@@ -59,5 +63,5 @@
     ]
   },
   // 21:00 UTC = 03:00 Asia/Dhaka — nightly history retention purge.
-  "triggers": { "crons": ["0 21 * * *"] }
+  "triggers": { "crons": ["* * * * *", "0 21 * * *"] }
 }

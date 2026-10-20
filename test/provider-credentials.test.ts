@@ -15,7 +15,7 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { buildDispatchPlan, invalidateAllAppConfigs } from "../src/core/plan";
+import { buildDispatchPlan, invalidateAllAppConfigs, loadAppConfig } from "../src/core/plan";
 import { createMaskingProfile, getDb, upsertGlobalProvider } from "../src/db";
 import { encryptSecret } from "../src/shared/crypto";
 
@@ -129,6 +129,19 @@ describe("upsertGlobalProvider", () => {
 });
 
 describe("buildDispatchPlan", () => {
+  it("healthy D1 supersedes a warm stale provider config", async () => {
+    await upsertGlobalProvider(db, { provider: "bulksmsbd", enabled: true, priority: 1, apiKeyEnc: await encryptSecret(testEnv, "old"), senderId: "old" });
+    await loadAppConfig(testEnv, db, 1);
+    await upsertGlobalProvider(db, { provider: "bulksmsbd", enabled: false, priority: 1 });
+    expect((await buildDispatchPlan(testEnv, db, 1)).entries).toHaveLength(0);
+  });
+  it("a damaged credential cannot block a healthy fallback provider", async () => {
+    await upsertGlobalProvider(db, { provider: "bulksmsbd", enabled: true, priority: 1, apiKeyEnc: "broken", senderId: "123" });
+    await upsertGlobalProvider(db, { provider: "mimsms", enabled: true, priority: 2, apiKeyEnc: await encryptSecret(testEnv, "valid"), username: "user", senderName: "brand" });
+    const plan = await buildDispatchPlan(testEnv, db, 1);
+    expect(plan.entries.map((entry) => entry.provider.name)).toEqual(["mimsms"]);
+    expect(plan.warnings).toEqual(["bulksmsbd omitted: credentials could not be loaded"]);
+  });
   it("bulksmsbd with api key + sender id: 1 entry, no warnings", async () => {
     await upsertGlobalProvider(db, {
       provider: "bulksmsbd",

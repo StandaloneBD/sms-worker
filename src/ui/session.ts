@@ -15,15 +15,17 @@ import { SESSION_COOKIE, SESSION_TTL_SECONDS } from "../shared/constants";
 import { signSession, verifySession } from "../shared/crypto";
 import type { AppEnv } from "../shared/types";
 import { adminPath } from "./paths";
+import { getDb } from "../db";
+import { getAdminById } from "./data";
 
 function isHttps(c: Context<AppEnv>): boolean {
   return new URL(c.req.url).protocol === "https:";
 }
 
 /** Signs a fresh session token (exp = now + SESSION_TTL_SECONDS) and sets the cookie. */
-export async function createSession(c: Context<AppEnv>, adminId: number): Promise<void> {
+export async function createSession(c: Context<AppEnv>, adminId: number, passwordHash: string): Promise<void> {
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
-  const token = await signSession(c.env, adminId, expiresAt);
+  const token = await signSession(c.env, adminId, expiresAt, passwordHash);
   setCookie(c, SESSION_COOKIE, token, {
     httpOnly: true,
     sameSite: "Lax",
@@ -42,7 +44,14 @@ export function clearSession(c: Context<AppEnv>): void {
 export async function readSession(c: Context<AppEnv>): Promise<number | null> {
   const token = getCookie(c, SESSION_COOKIE);
   if (!token) return null;
-  return verifySession(c.env, token);
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const adminId = Number(parts[0]);
+  const exp = Number(parts[1]);
+  if (!Number.isSafeInteger(adminId) || adminId <= 0 || !Number.isSafeInteger(exp) || exp <= Math.floor(Date.now() / 1000)) return null;
+  const admin = await getAdminById(getDb(c.env), adminId);
+  if (!admin) return null;
+  return verifySession(c.env, token, admin.passwordHash);
 }
 
 /** Gate for every route registered after this middleware: no valid session → redirect to /login. */
@@ -55,19 +64,20 @@ export async function authMiddleware(c: Context<AppEnv>, next: Next): Promise<Re
   await next();
 }
 
-/** CSRF guard for all POSTs: a present Origin header whose host differs from the request host is rejected. */
+/** Browser POSTs must come from the same origin, including scheme/port. */
 export async function csrfMiddleware(c: Context<AppEnv>, next: Next): Promise<Response | void> {
   if (c.req.method === "POST") {
     const origin = c.req.header("Origin");
-    if (origin) {
-      let originHost: string;
+    if (c.req.header("Sec-Fetch-Site") === "cross-site") return c.text("Forbidden: cross-origin request", 403);
+    const source = origin ?? c.req.header("Referer");
+    if (source) {
+      let sourceOrigin: string;
       try {
-        originHost = new URL(origin).host;
+        sourceOrigin = new URL(source).origin;
       } catch {
         return c.text("Forbidden: invalid Origin", 403);
       }
-      const requestHost = new URL(c.req.url).host;
-      if (originHost !== requestHost) {
+      if (sourceOrigin !== new URL(c.req.url).origin) {
         return c.text("Forbidden: cross-origin request", 403);
       }
     }

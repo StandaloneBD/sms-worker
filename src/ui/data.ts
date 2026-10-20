@@ -60,7 +60,7 @@ export async function getAppProviderRows(db: Db, appId: number): Promise<AppProv
     const override = overrideMap.get(provider);
     if (override) return override;
     const global = globalMap.get(provider);
-    return { provider, enabled: global?.enabled ?? false, priority: global?.priority ?? 100 };
+    return { provider, enabled: overrides.length === 0 && (global?.enabled ?? false), priority: global?.priority ?? 100 };
   });
 }
 

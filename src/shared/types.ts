@@ -77,7 +77,7 @@ export interface JobRecipient {
 export interface JobPayload {
   jobId: string;
   appId: number;
-  /** Uniform body; absent when templateId or per-recipient messages are used. */
+  /** Fallback body for recipients without an override; absent when a template is used. */
   message?: string;
   templateId?: number;
   /** Pre-fetched template body so the consumer never depends on D1 for it. */

@@ -6,9 +6,8 @@
  *   masking profile (app-owned, D1, api key AES-GCM encrypted)
  *     → global provider settings (D1, api key AES-GCM encrypted).
  *
- * App config is KV-cached (ADR 0002: the cache is an availability shield —
- * a warm cache lets sends proceed through a D1 outage). D1 stays the source
- * of truth; admin/API mutations call `invalidateAppConfig`.
+ * D1 is read first; KV is the outage fallback (ADR 0002's availability
+ * shield). Mutations purge fallback entries on a best-effort basis.
  */
 
 import type { Db } from "../db/queries";
@@ -46,13 +45,18 @@ export interface AppDispatchConfig {
 export async function loadAppConfig(env: Env, db: Db, appId: number): Promise<AppDispatchConfig> {
   const key = kvAppConfig(appId);
   const cached = await env.CACHE.get<AppDispatchConfig>(key, "json").catch(() => null);
-  if (cached) return cached;
-
-  const [plan, globalRows, profiles] = await Promise.all([
-    getAppProviderPlan(db, appId),
-    getGlobalProviders(db),
-    listMaskingProfiles(db, appId),
-  ]);
+  let rows;
+  try {
+    rows = await Promise.all([
+      getAppProviderPlan(db, appId),
+      getGlobalProviders(db),
+      listMaskingProfiles(db, appId),
+    ]);
+  } catch (err) {
+    if (cached) return cached;
+    throw err;
+  }
+  const [plan, globalRows, profiles] = rows;
 
   const config: AppDispatchConfig = {
     plan,
@@ -73,11 +77,13 @@ export async function loadAppConfig(env: Env, db: Db, appId: number): Promise<Ap
   };
 
   // Cache write is best-effort: a KV failure must never fail a send.
-  await env.CACHE.put(key, JSON.stringify(config), { expirationTtl: KV_TTL_SECONDS }).catch(
-    (err: unknown) => {
-      console.warn(JSON.stringify({ event: "app_config_cache_put_failed", appId, error: String(err) }));
-    },
-  );
+  if (!cached || JSON.stringify(cached) !== JSON.stringify(config)) {
+    await env.CACHE.put(key, JSON.stringify(config), { expirationTtl: KV_TTL_SECONDS }).catch(
+      (err: unknown) => {
+        console.warn(JSON.stringify({ event: "app_config_cache_put_failed", appId, error: String(err) }));
+      },
+    );
+  }
   return config;
 }
 
@@ -142,14 +148,13 @@ export async function buildDispatchPlan(
     // credentials is omitted from the chain rather than failing the whole
     // dispatch — the warning is additive, callers treat warnings as
     // non-fatal.
-    const apiKeyEnc = profile?.apiKeyEnc ?? global?.apiKeyEnc;
-    const apiKey = apiKeyEnc ? await decryptSecret(env, apiKeyEnc) : undefined;
-    if (!apiKey) {
-      warnings.push(`${item.provider} omitted: no API key configured (Admin → Providers)`);
-      continue;
-    }
-
     try {
+      const apiKeyEnc = profile?.apiKeyEnc ?? global?.apiKeyEnc;
+      const apiKey = apiKeyEnc ? await decryptSecret(env, apiKeyEnc) : undefined;
+      if (!apiKey) {
+        warnings.push(`${item.provider} omitted: no API key configured (Admin → Providers)`);
+        continue;
+      }
       if (item.provider === "bulksmsbd") {
         const senderId = profile?.senderId ?? global?.senderId;
         if (!senderId) {
@@ -167,7 +172,8 @@ export async function buildDispatchPlan(
         entries.push({ provider: new MimSms({ apiKey, username, senderName }) });
       }
     } catch (err) {
-      warnings.push(`${item.provider} omitted: ${err instanceof Error ? err.message : String(err)}`);
+      console.error(JSON.stringify({ event: "provider_credentials_invalid", provider: item.provider, appId, error: err instanceof Error ? err.message : String(err) }));
+      warnings.push(`${item.provider} omitted: credentials could not be loaded`);
     }
   }
 

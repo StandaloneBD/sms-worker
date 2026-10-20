@@ -6,9 +6,11 @@ import { Hono } from "hono";
 import { createTemplate, deleteTemplate, getDb, isUniqueConstraintError, listTemplates, updateTemplate } from "../db";
 import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH } from "../shared/constants";
 import type { AppEnv } from "../shared/types";
-import { fail, parseIdParam, readJsonBody } from "./validate";
+import { fail, jsonObject, parseIdParam, readJsonBody } from "./validate";
+import { requestBodyLimit } from "../shared/body-limit";
 
 export const templatesRoutes = new Hono<AppEnv>();
+templatesRoutes.use("*", requestBodyLimit(64 * 1024));
 
 function validateName(name: unknown): string {
   if (typeof name !== "string" || name.length < 1 || name.length > MAX_TEMPLATE_NAME_LENGTH) {
@@ -32,7 +34,7 @@ templatesRoutes.get("/templates", async (c) => {
 
 templatesRoutes.post("/templates", async (c) => {
   const db = getDb(c.env);
-  const raw = await readJsonBody<Record<string, unknown>>(c);
+  const raw = jsonObject(await readJsonBody<unknown>(c));
   const name = validateName(raw.name);
   const body = validateBody(raw.body);
   try {
@@ -47,7 +49,7 @@ templatesRoutes.post("/templates", async (c) => {
 templatesRoutes.put("/templates/:id", async (c) => {
   const db = getDb(c.env);
   const id = parseIdParam(c.req.param("id"));
-  const raw = await readJsonBody<Record<string, unknown>>(c);
+  const raw = jsonObject(await readJsonBody<unknown>(c));
   const patch: { name?: string; body?: string } = {};
   if (raw.name !== undefined) patch.name = validateName(raw.name);
   if (raw.body !== undefined) patch.body = validateBody(raw.body);

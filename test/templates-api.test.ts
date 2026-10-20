@@ -142,6 +142,11 @@ describe("GET /templates", () => {
 });
 
 describe("POST /templates", () => {
+  it.each([null, [], 12, "text"])("400 for a non-object JSON body (%j)", async (body) => {
+    const res = await postTemplate(APP_A, body);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "body must be a JSON object" });
+  });
   it("201: creates a template, echoing name/body/appId with timestamps set", async () => {
     const res = await postTemplate(APP_A, { name: "welcome", body: "Hi there" });
     expect(res.status).toBe(201);

@@ -6,20 +6,19 @@
  */
 
 import { Hono } from "hono";
-import { bodyLimit } from "hono/body-limit";
+import { requestBodyLimit } from "../shared/body-limit";
 import {
   getDb,
   getJobForApp,
   getTemplate,
-  insertJobChunks,
-  insertJob,
+  insertJobWithChunks,
   insertMessages,
   jobs,
   listMessagesByJob,
-  markJobFailed,
   type NewMessageRow,
 } from "../db";
 import { buildDispatchPlan } from "../core/plan";
+import { enqueueJob } from "../queue/producer";
 import { dispatch } from "../sms/dispatch";
 import { isValidPhone } from "../sms/phone";
 import { renderTemplate } from "../sms/template";
@@ -28,13 +27,13 @@ import {
   MAX_BODY_BYTES,
   MAX_JOB_RECIPIENTS,
   MAX_MESSAGE_LENGTH,
+  MAX_REASON_LENGTH,
   MAX_SYNC_BODY_BYTES,
   MAX_SYNC_RECIPIENTS,
   r2JobKey,
 } from "../shared/constants";
 import type {
   AppEnv,
-  ChunkQueueMessage,
   DispatchInput,
   DispatchResultItem,
   JobPayload,
@@ -52,15 +51,6 @@ import {
 
 export const smsRoutes = new Hono<AppEnv>();
 
-/** Cloudflare Queues hard cap on messages per sendBatch() call. */
-const QUEUE_SEND_BATCH_LIMIT = 100;
-const REASON_MAX_LENGTH = 500;
-
-/** Shared 413 handler for both body-limit middlewares below — matches the
- *  API's normal error envelope via `fail()` + the apiRoutes-level onError
- *  (see api/index.ts) rather than hono/body-limit's plain-text default. */
-const rejectOversizedBody = () => fail(413, "request body too large");
-
 interface SendFields {
   message?: string;
   templateId?: number;
@@ -77,14 +67,20 @@ function parseSendFields(raw: unknown): SendFields {
   if (obj.message !== undefined && typeof obj.message !== "string") {
     fail(400, `"message" must be a string`);
   }
+  if (typeof obj.message === "string" && obj.message.length > MAX_MESSAGE_LENGTH) {
+    fail(400, `"message" exceeds ${MAX_MESSAGE_LENGTH} characters`);
+  }
   if (
     obj.templateId !== undefined &&
-    (typeof obj.templateId !== "number" || !Number.isInteger(obj.templateId))
+    (typeof obj.templateId !== "number" || !Number.isSafeInteger(obj.templateId) || obj.templateId <= 0)
   ) {
-    fail(400, `"templateId" must be an integer`);
+    fail(400, `"templateId" must be a positive integer`);
   }
   if (obj.maskingProfile !== undefined && typeof obj.maskingProfile !== "string") {
     fail(400, `"maskingProfile" must be a string`);
+  }
+  if (typeof obj.maskingProfile === "string" && (obj.maskingProfile.length < 1 || obj.maskingProfile.length > 32)) {
+    fail(400, `"maskingProfile" must be 1-32 characters`);
   }
 
   return {
@@ -116,7 +112,7 @@ function hadOverride(recipient: RecipientInput): boolean {
 
 smsRoutes.post(
   "/sms/send",
-  bodyLimit({ maxSize: MAX_SYNC_BODY_BYTES, onError: rejectOversizedBody }),
+  requestBodyLimit(MAX_SYNC_BODY_BYTES),
   async (c) => {
     const db = getDb(c.env);
     const app = c.var.app;
@@ -186,7 +182,7 @@ smsRoutes.post(
     const nowSeconds = Math.floor(Date.now() / 1000);
 
     const jobBody: string | null =
-      fields.templateId !== undefined ? (templateBody ?? null) : uniform ? (validBodies[0] ?? null) : null;
+      fields.templateId !== undefined ? (templateBody ?? null) : (fields.message ?? null);
 
     // History write is best-effort and happens after the response is already
     // decided (ADR 0002) — never awaited by the request itself. `insertJob`'s
@@ -220,10 +216,10 @@ smsRoutes.post(
               jobId: id,
               appId: app.id,
               recipient: recipient.to,
-              body: recipient.message !== undefined ? recipient.message : null,
+              body: fields.templateId !== undefined || recipient.message !== undefined ? (bodies[index] ?? null) : null,
               provider: result.provider ?? null,
               status: result.accepted ? "sent" : "failed",
-              reason: result.reason ? truncate(result.reason, REASON_MAX_LENGTH) : null,
+              reason: result.reason ? truncate(result.reason, MAX_REASON_LENGTH) : null,
               trackingId: result.trackingId ?? null,
             };
           });
@@ -251,7 +247,7 @@ smsRoutes.post(
 
 smsRoutes.post(
   "/sms/jobs",
-  bodyLimit({ maxSize: MAX_BODY_BYTES, onError: rejectOversizedBody }),
+  requestBodyLimit(MAX_BODY_BYTES),
   async (c) => {
     const db = getDb(c.env);
     const app = c.var.app;
@@ -283,7 +279,6 @@ smsRoutes.post(
       return c.json({ error: "invalid recipients", indexes: offending.slice(0, 10) }, 400);
     }
 
-    const anyOverride = normalized.some(hadOverride);
     const jobId = crypto.randomUUID();
     const chunkCount = Math.ceil(normalized.length / CHUNK_SIZE);
 
@@ -296,8 +291,8 @@ smsRoutes.post(
     const payload: JobPayload = {
       jobId,
       appId: app.id,
-      // Uniform body is only meaningful when nothing renders it per-recipient.
-      ...(fields.templateId === undefined && !anyOverride && fields.message !== undefined
+      // Keep the fallback body even when some recipients have overrides/vars.
+      ...(fields.templateId === undefined && fields.message !== undefined
         ? { message: fields.message }
         : {}),
       ...(fields.templateId !== undefined
@@ -315,7 +310,7 @@ smsRoutes.post(
       fields.templateId !== undefined ? (templateBody as string) : (payload.message ?? null);
 
     try {
-      await insertJob(db, {
+      await insertJobWithChunks(db, {
         id: jobId,
         appId: app.id,
         kind: "bulk",
@@ -326,13 +321,7 @@ smsRoutes.post(
         total: normalized.length,
         chunkCount,
       });
-      await insertJobChunks(db, jobId, chunkCount);
     } catch (err) {
-      await c.env.PAYLOADS.delete(r2Key).catch((delErr: unknown) => {
-        console.warn(
-          JSON.stringify({ event: "job_payload_cleanup_failed", jobId, error: String(delErr) }),
-        );
-      });
       console.error(
         JSON.stringify({
           event: "job_d1_write_failed",
@@ -341,18 +330,20 @@ smsRoutes.post(
           error: err instanceof Error ? err.message : String(err),
         }),
       );
-      return fail(503, "job could not be recorded; try again");
+      // A transport error can arrive AFTER D1 committed the atomic batch.
+      // Preserve R2 until retention: deleting it could strand a recorded job.
+      // Confirm the job when D1 is reachable, then continue publication.
+      const recorded = await getJobForApp(db, app.id, jobId).catch((confirmErr: unknown) => {
+        console.warn(JSON.stringify({ event: "job_d1_confirmation_failed", jobId, error: String(confirmErr) }));
+        return undefined;
+      });
+      if (!recorded) {
+        return c.json({ error: "job acceptance could not be confirmed; poll this job ID before resubmitting", jobId }, 503);
+      }
     }
 
     try {
-      const chunkMessages: ChunkQueueMessage[] = Array.from({ length: chunkCount }, (_, i) => ({
-        jobId,
-        chunkIndex: i,
-      }));
-      for (let offset = 0; offset < chunkMessages.length; offset += QUEUE_SEND_BATCH_LIMIT) {
-        const slice = chunkMessages.slice(offset, offset + QUEUE_SEND_BATCH_LIMIT);
-        await c.env.SMS_QUEUE.sendBatch(slice.map((body) => ({ body })));
-      }
+      await enqueueJob(c.env, db, jobId);
     } catch (err) {
       console.error(
         JSON.stringify({
@@ -362,15 +353,9 @@ smsRoutes.post(
           error: err instanceof Error ? err.message : String(err),
         }),
       );
-      await markJobFailed(db, jobId, "failed to enqueue chunks").catch((markErr: unknown) => {
-        console.error(
-          JSON.stringify({ event: "job_mark_failed_failed", jobId, error: String(markErr) }),
-        );
-      });
-      await c.env.PAYLOADS.delete(r2Key).catch(() => {
-        // best-effort; the job is already marked failed above
-      });
-      return fail(503, "job accepted but could not be queued");
+      // D1 + R2 durably accepted the job. Retain both after an ambiguous or
+      // partial enqueue; the minute cron resumes pending chunks from D1.
+      return c.json({ jobId, total: normalized.length, chunkCount, warnings: ["queue publication delayed; recovery will retry"] }, 202);
     }
 
     return c.json({ jobId, total: normalized.length, chunkCount }, 202);

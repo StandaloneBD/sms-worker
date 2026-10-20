@@ -9,7 +9,7 @@ export const PAGE_SIZE = 20;
 /** Defensive non-negative integer offset from a query param. */
 export function parseOffset(raw: string | undefined): number {
   const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return 0;
+  if (!Number.isSafeInteger(n) || n < 0) return 0;
   return n;
 }
 
@@ -17,7 +17,7 @@ export function parseOffset(raw: string | undefined): number {
 export function parseIntOr(raw: string | undefined, fallback: number): number {
   if (raw === undefined) return fallback;
   const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n)) return fallback;
+  if (!Number.isSafeInteger(n)) return fallback;
   return n;
 }
 
@@ -25,7 +25,7 @@ export function parseIntOr(raw: string | undefined, fallback: number): number {
 export function parseId(raw: string | undefined): number | null {
   if (raw === undefined) return null;
   const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
+  if (!Number.isSafeInteger(n) || n <= 0) return null;
   return n;
 }
 
@@ -65,7 +65,7 @@ const GSM7_EXTENDED = new Set(Array.from("^{}\\[~]|€"));
  * count the SMSC actually segments on: septets for GSM-7 (each
  * extension-table character costs 2), or UTF-16 code units for UCS-2. The
  * two diverge for astral characters (e.g. emoji) — `"😀"` is one `chars` but
- * two UTF-16 code units, so it must count as 2 toward the UCS-2 160/153-unit
+ * two UTF-16 code units, so it must count as 2 toward the UCS-2 70/67-unit
  * segment budget, not 1.
  */
 export function smsSegments(body: string): {
@@ -111,4 +111,10 @@ export function formRaw(value: string | File | undefined): string {
 /** Presence check for an HTML checkbox field in parsed form data. */
 export function formChecked(value: string | File | undefined): boolean {
   return typeof value === "string" && value.length > 0;
+}
+
+export function providerCredentialError(fields: { apiKey: string; senderId: string; senderName: string; username: string }): string | null {
+  if (fields.apiKey.length > 512 || /\s/.test(fields.apiKey)) return "API key must be at most 512 characters and contain no whitespace.";
+  if ([fields.senderId, fields.senderName, fields.username].some((value) => value.length > 128)) return "Sender identity and username must be at most 128 characters.";
+  return null;
 }

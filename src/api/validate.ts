@@ -22,9 +22,17 @@ export function fail(status: ContentfulStatusCode, message: string): never {
 export async function readJsonBody<T>(c: Context<AppEnv>): Promise<T> {
   try {
     return await c.req.json<T>();
-  } catch {
+  } catch (err) {
+    if (err instanceof HTTPException) throw err;
     return fail(400, "malformed JSON body");
   }
+}
+
+export function jsonObject(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return fail(400, "body must be a JSON object");
+  }
+  return raw as Record<string, unknown>;
 }
 
 export function truncate(text: string, maxLength: number): string {
@@ -98,7 +106,7 @@ export function assertRecipientCount(count: number, max: number): void {
 
 export function parseIdParam(value: string): number {
   const id = Number(value);
-  if (!Number.isInteger(id) || id <= 0) fail(400, "invalid id");
+  if (!Number.isSafeInteger(id) || id <= 0) fail(400, "invalid id");
   return id;
 }
 
@@ -108,7 +116,7 @@ export function parseQueryInt(
 ): number {
   if (value === undefined || value === "") return opts.default;
   const n = Number(value);
-  if (!Number.isInteger(n)) return opts.default;
+  if (!Number.isSafeInteger(n)) return opts.default;
   let result = n;
   if (opts.min !== undefined) result = Math.max(opts.min, result);
   if (opts.max !== undefined) result = Math.min(opts.max, result);

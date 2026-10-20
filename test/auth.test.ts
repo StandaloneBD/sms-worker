@@ -64,6 +64,12 @@ beforeEach(async () => {
 });
 
 describe("authMiddleware", () => {
+  it("rejects malformed fallback cache data during a D1 outage", async () => {
+    await env.CACHE.put(kvAppByKeyHash(HASH), JSON.stringify({ id: 1, name: "Acme", isActive: "false" }));
+    dbState.error = new Error("D1 unreachable");
+    const { ctx } = fakeCtx();
+    expect((await makeApp().request("/", { headers: authedHeaders() }, env, ctx)).status).toBe(503);
+  });
   it("valid key: D1 row -> 200 and warms KV", async () => {
     dbState.row = { id: 1, name: "Acme", isActive: true };
     const { ctx, flush } = fakeCtx();
