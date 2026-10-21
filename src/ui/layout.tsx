@@ -5,7 +5,8 @@
  * beyond /admin/confirm.js, which prompts before submitting any form with a
  * data-confirm attribute, /admin/expand.js, which opens and closes row
  * details, and /admin/provider-order.js on pages with a provider order
- * (the admin CSP forbids inline script).
+ * (the admin CSP forbids inline script). Those scripts and the favicon are
+ * static assets in public/, served without invoking the Worker.
  *
  * The CSS is injected via dangerouslySetInnerHTML: hono/jsx escapes text
  * children by default (including inside <style>, an HTML "raw text"
@@ -1290,6 +1291,8 @@ function Head({ title }: { title: string }) {
       <meta charset="utf-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <title>{title} · SMS Worker Admin</title>
+      {/* Without it browsers request /favicon.ico, which would reach the Worker. */}
+      <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
       <link rel="preconnect" href="https://fonts.googleapis.com" />
       <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
       <link rel="stylesheet" href={FONTS_HREF} />

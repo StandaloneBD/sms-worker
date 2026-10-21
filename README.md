@@ -149,6 +149,9 @@ credentials in the UI.
   `LOGIN_LIMITER` (per IP, admin sign-in attempts per minute).
 - Queue consumer `max_concurrency` caps parallel chunk sends (provider rate
   limits, D1 write contention).
+- `assets` — files in `public/` (admin scripts, favicon) are served as
+  Workers Static Assets without invoking the Worker, so they don't count
+  toward Worker requests. Their response headers go in `public/_headers`.
 
 ## API
 

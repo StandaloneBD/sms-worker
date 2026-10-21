@@ -35,15 +35,15 @@ import { jobDetailGet, jobRedirectGet, jobsListGet } from "./pages/jobs";
 import { loginGet, loginPost, logoutPost } from "./pages/login";
 import { messagesGet } from "./pages/messages";
 import { providersGet, providersPost } from "./pages/providers";
-import { PROVIDER_ORDER_SCRIPT } from "./provider-order";
 import { settingsGet, settingsPost } from "./pages/settings";
 import { templateEditGet, templateEditPost } from "./pages/templates";
 import { authMiddleware, csrfMiddleware } from "./session";
 
 export const adminRoutes = new Hono<AppEnv>({ strict: false });
 
-// Pages run no inline script (confirm prompts come from CONFIRM_SCRIPT, row
-// details from EXPAND_SCRIPT, provider reordering from PROVIDER_ORDER_SCRIPT);
+// Pages run no inline script: confirm prompts, row details and provider
+// reordering come from public/admin/*.js, served as static assets before the
+// Worker runs (see wrangler.jsonc "assets" and public/_headers);
 // inline styles stay allowed for the shell's <style> block and style attrs.
 const ADMIN_CSP = [
   "default-src 'none'",
@@ -56,13 +56,6 @@ const ADMIN_CSP = [
   "base-uri 'none'",
 ].join("; ");
 
-/** Asks before submitting any form carrying data-confirm. */
-const CONFIRM_SCRIPT = `document.addEventListener("submit", (event) => {
-  const message = event.target instanceof HTMLFormElement ? event.target.dataset.confirm : undefined;
-  if (message && !confirm(message)) event.preventDefault();
-});
-`;
-
 adminRoutes.use("*", async (c, next) => {
   c.header("Cache-Control", "no-store");
   c.header("X-Content-Type-Options", "nosniff");
@@ -72,25 +65,6 @@ adminRoutes.use("*", async (c, next) => {
   await next();
 });
 adminRoutes.use("*", requestBodyLimit(64 * 1024));
-
-/**
- * Disclosure buttons: a [data-expand] button shows/hides the element its
- * aria-controls names (a message's detail row). The details render hidden;
- * the shell's <noscript> style reveals them when this can't run.
- */
-const EXPAND_SCRIPT = `document.addEventListener("click", (event) => {
-  const button = event.target instanceof Element ? event.target.closest("[data-expand]") : null;
-  const target = button && document.getElementById(button.getAttribute("aria-controls"));
-  if (!target) return;
-  const open = button.getAttribute("aria-expanded") !== "true";
-  button.setAttribute("aria-expanded", String(open));
-  target.hidden = !open;
-});
-`;
-
-adminRoutes.get("/confirm.js", (c) => c.body(CONFIRM_SCRIPT, 200, { "content-type": "text/javascript; charset=utf-8" }));
-adminRoutes.get("/expand.js", (c) => c.body(EXPAND_SCRIPT, 200, { "content-type": "text/javascript; charset=utf-8" }));
-adminRoutes.get("/provider-order.js", (c) => c.body(PROVIDER_ORDER_SCRIPT, 200, { "content-type": "text/javascript; charset=utf-8" }));
 
 // CSRF: applies to every route registered below, including /login.
 adminRoutes.use("*", csrfMiddleware);

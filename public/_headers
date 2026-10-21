@@ -1,0 +1,6 @@
+# Headers for static assets only — Worker responses set their own (see
+# src/index.ts and src/ui/index.tsx). Assets are served without running the
+# Worker, so its HSTS middleware never sees them.
+/*
+  Strict-Transport-Security: max-age=31536000
+  X-Content-Type-Options: nosniff

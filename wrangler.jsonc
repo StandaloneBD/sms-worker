@@ -18,6 +18,11 @@
   // any zone-level WAF, Access, or rate-limit rules on that domain.
   "workers_dev": false,
   "preview_urls": false,
+  // Static files (admin scripts, favicon) are served by Workers Static Assets
+  // before the Worker runs, so they don't count as Worker requests. Any path
+  // without a matching file falls through to the Worker (not_found_handling
+  // defaults to "none"). Response headers for them live in public/_headers.
+  "assets": { "directory": "./public" },
   "vars": {
     "FAKE_SMS": "false",
     // Comma-separated browser origins allowed to call /v1 (CORS), or "*" for
