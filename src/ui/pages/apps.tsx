@@ -1,6 +1,6 @@
 /**
  * GET/POST /apps (list + create) and an App's configuration page
- * (/apps/:id/config): activate toggle, key rotation, daily quota, provider
+ * (/apps/:id/config): activate toggle, key rotation, IP allowlist, daily quota, provider
  * plan, masking profiles, and template create/delete (edit lives on its own
  * page, see ./templates). Its overview, jobs and messages are ./app-overview,
  * ./jobs and ./messages.
@@ -22,12 +22,19 @@ import {
   rotateAppKey,
   setAppActive,
   setAppDailyQuota,
+  setAppIpAllowlist,
   upsertAppProviders,
 } from "../../db/queries";
 import { invalidateAppConfig } from "../../core/plan";
-import { invalidateAppAuthCache, writeAppAuthCache } from "../../core/auth-cache";
+import { invalidateAppAuthCache, toAuthedApp, writeAppAuthCache } from "../../core/auth-cache";
 import { encryptSecret, generateApiKey } from "../../shared/crypto";
-import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH, usageDay } from "../../shared/constants";
+import {
+  MAX_IP_ALLOWLIST_ENTRIES,
+  MAX_MESSAGE_LENGTH,
+  MAX_TEMPLATE_NAME_LENGTH,
+  usageDay,
+} from "../../shared/constants";
+import { normalizeIpEntry } from "../../shared/ip";
 import { PROVIDER_NAMES } from "../../shared/types";
 import type { AppEnv, ProviderName } from "../../shared/types";
 import { AppHeader, Empty, Kv, NotFoundPage, PageHeader, Panel, Segments } from "../components";
@@ -170,14 +177,31 @@ export async function appConfigGet(c: Context<AppEnv>): Promise<Response> {
   if (!app) {
     return c.html(<NotFoundPage flash={readFlash(c)} what="App" />, 404);
   }
+  return renderAppConfig(c, app, { flash: readFlash(c) });
+}
 
+type AppRow = NonNullable<Awaited<ReturnType<typeof getAppById>>>;
+
+/** An IP allowlist submission that failed validation, shown back in the form
+ *  so the admin can correct it instead of typing it all again. */
+interface IpAllowlistDraft {
+  enabled: boolean;
+  entries: string;
+}
+
+async function renderAppConfig(
+  c: Context<AppEnv>,
+  app: AppRow,
+  opts: { flash?: Flash; ipAllowlistDraft?: IpAllowlistDraft },
+): Promise<Response> {
+  const db = getDb(c.env);
   const [providerRows, profiles, templates, usedToday] = await Promise.all([
-    getAppProviderRows(db, id),
-    listMaskingProfiles(db, id),
-    listTemplates(db, id),
-    getAppUsage(db, id, usageDay()),
+    getAppProviderRows(db, app.id),
+    listMaskingProfiles(db, app.id),
+    listTemplates(db, app.id),
+    getAppUsage(db, app.id, usageDay()),
   ]);
-  const flash = readFlash(c);
+  const { flash, ipAllowlistDraft } = opts;
   // Listed in priority order, which is the order this app's sends try them in.
   const planRows = [...providerRows].sort((a, b) => a.priority - b.priority);
   const nextRank = rankCounter();
@@ -188,6 +212,7 @@ export async function appConfigGet(c: Context<AppEnv>): Promise<Response> {
 
       <nav class="jump" aria-label="Configuration sections">
         <a href="#access">Access</a>
+        <a href="#ip-allowlist">IP allowlist</a>
         <a href="#quota">Daily quota</a>
         <a href="#providers">Provider plan</a>
         <a href="#masking">Masking profiles</a>
@@ -227,6 +252,43 @@ export async function appConfigGet(c: Context<AppEnv>): Promise<Response> {
             { label: "Registered", value: <span class="mono">{formatTs(app.createdAt)}</span> },
           ]}
         />
+      </Panel>
+
+      <Panel id="ip-allowlist" title="IP allowlist">
+        <form method="post" action={adminPath(`/apps/${app.id}/ip-allowlist`)}>
+          <div class="field">
+            <label class="switch-label">
+              <input
+                class="switch"
+                type="checkbox"
+                name="enabled"
+                value="on"
+                checked={ipAllowlistDraft ? ipAllowlistDraft.enabled : app.ipAllowlistEnabled}
+              />
+              Only these addresses may send or make changes
+            </label>
+          </div>
+          <div class="field field-narrow">
+            <label for="ip-allowlist-entries">Addresses, one per line</label>
+            <textarea
+              class="input mono"
+              id="ip-allowlist-entries"
+              name="entries"
+              rows={4}
+              placeholder={"203.0.113.7\n198.51.100.0/28\n2001:db8::/48"}
+            >{ipAllowlistDraft ? ipAllowlistDraft.entries : app.ipAllowlist.join("\n")}</textarea>
+          </div>
+          <p class="hint">
+            IPv4 or IPv6 addresses, or CIDR ranges. When on, sends, jobs and template or provider changes from
+            any other address get a 403; reads such as job status stay open. A server with IPv6 usually reaches
+            the API over IPv6, so add its IPv6 address too. The list is kept while switched off.
+          </p>
+          <div class="form-actions">
+            <button type="submit" class="btn btn-primary">
+              Save IP allowlist
+            </button>
+          </div>
+        </form>
       </Panel>
 
       <Panel id="quota" title="Daily quota">
@@ -457,6 +519,7 @@ export async function appConfigGet(c: Context<AppEnv>): Promise<Response> {
         </div>
       </Panel>
     </Layout>,
+    ipAllowlistDraft ? 400 : 200,
   );
 }
 
@@ -484,16 +547,62 @@ export async function appQuotaPost(c: Context<AppEnv>): Promise<Response> {
   await setAppDailyQuota(db, id, quota);
   // Auth reads D1 first, so the next request already sees the new quota;
   // the cached verdict is refreshed so a D1 outage doesn't serve the old one.
-  await writeAppAuthCache(c.env, app.keyHash, {
-    id: app.id,
-    name: app.name,
-    isActive: app.isActive,
-    dailyQuota: quota,
-  });
+  await writeAppAuthCache(c.env, app.keyHash, toAuthedApp({ ...app, dailyQuota: quota }));
   return redirectFlash(
     c,
     appPath(id, "config"),
     quota === null ? "Daily quota removed." : `Daily quota set to ${quota} recipients.`,
+  );
+}
+
+export async function appIpAllowlistPost(c: Context<AppEnv>): Promise<Response> {
+  const id = parseId(c.req.param("id"));
+  if (id === null) return notFoundOrRedirect(c);
+  const db = getDb(c.env);
+  const app = await getAppById(db, id);
+  if (!app) return notFoundOrRedirect(c);
+
+  const body = await c.req.parseBody();
+  const draft: IpAllowlistDraft = { enabled: formChecked(body.enabled), entries: formStr(body.entries) };
+  // Rejected input is shown back in the form rather than lost to a redirect.
+  const reject = (message: string) =>
+    renderAppConfig(c, app, { flash: { message, type: "error" }, ipAllowlistDraft: draft });
+
+  const entries: string[] = [];
+  const lines = draft.entries.split(/\r?\n/);
+  for (const [index, line] of lines.entries()) {
+    for (const raw of line.split(/[\s,]+/)) {
+      if (raw === "") continue;
+      const entry = normalizeIpEntry(raw);
+      if (entry === null) {
+        const shown = raw.length > 45 ? `${raw.slice(0, 45)}…` : raw;
+        return reject(`Line ${index + 1}: "${shown}" is not an IP address or CIDR range.`);
+      }
+      if (!entries.includes(entry)) entries.push(entry);
+    }
+  }
+  if (entries.length > MAX_IP_ALLOWLIST_ENTRIES) {
+    return reject(`The IP allowlist can hold at most ${MAX_IP_ALLOWLIST_ENTRIES} entries.`);
+  }
+  const { enabled } = draft;
+  if (enabled && entries.length === 0) {
+    return reject("Add at least one address before turning the IP allowlist on.");
+  }
+
+  await setAppIpAllowlist(db, id, { enabled, entries });
+  // Auth reads D1 first, so the next request already sees the new list; the
+  // cached verdict is refreshed so a D1 outage doesn't serve the old one.
+  await writeAppAuthCache(
+    c.env,
+    app.keyHash,
+    toAuthedApp({ ...app, ipAllowlistEnabled: enabled, ipAllowlist: entries }),
+  );
+  return redirectFlash(
+    c,
+    appPath(id, "config"),
+    enabled
+      ? `IP allowlist on with ${entries.length} ${entries.length === 1 ? "entry" : "entries"}.`
+      : "IP allowlist off: any address may send.",
   );
 }
 
@@ -509,12 +618,7 @@ export async function appActivePost(c: Context<AppEnv>): Promise<Response> {
   await setAppActive(db, id, desired);
   // Overwrite (not delete) so an outage-time request sees 403 rather than
   // 503 for a key we know is deactivated (ADR 0003).
-  await writeAppAuthCache(c.env, app.keyHash, {
-    id: app.id,
-    name: app.name,
-    isActive: desired,
-    dailyQuota: app.dailyQuota,
-  });
+  await writeAppAuthCache(c.env, app.keyHash, toAuthedApp({ ...app, isActive: desired }));
   return redirectFlash(
     c,
     appPath(id, "config"),

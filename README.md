@@ -197,6 +197,11 @@ sender identity/credentials — an unknown label is a 400. Providers without
 that profile fall back to the global sender identity unless
 `"maskingStrict": true`, which leaves them out of the chain.
 
+Add `"requiredTemplateTokens": ["OTP"]` to a template send/job to require
+that the template (as it is now) contains each named placeholder and every
+recipient has a non-blank `vars` value for it — otherwise a 400, so an
+edited template can never send an OTP without its code.
+
 ### Idempotency
 
 Send `Idempotency-Key: <1-255 chars>` on `/sms/send` and `/sms/jobs` to make
@@ -204,6 +209,19 @@ retries safe. A repeat with the same key and body within 24 h returns the
 original response (header `Idempotent-Replayed: true`) instead of sending
 again; 409 while the first request is still running; 422 if the key was used
 for a different body. Failed (non-2xx) requests don't keep the key.
+If the key can't be recorded, `/sms/jobs` returns 503 rather than submitting
+without it; `/sms/send` can proceed without idempotency.
+
+### IP allowlist
+
+An app can turn on an IP allowlist (Admin → Apps → Configuration): IPv4 or
+IPv6 addresses and CIDR ranges. While it's on, every write request (`POST`
+`/sms/send` and `/sms/jobs`, template create/update/delete, `PUT /providers`)
+from any other address gets `403 {"error": "ip not allowed", "ip": "<your
+address>"}`. `GET` requests (job progress, messages, templates) work from
+anywhere. The address checked is Cloudflare's `CF-Connecting-IP`. A server
+with IPv6 usually connects over IPv6, so list its IPv6 address as well.
+See ADR 0006.
 
 ### Request limits
 
@@ -230,7 +248,7 @@ for a different body. Failed (non-2xx) requests don't keep the key.
   happens inside its adapter only.
 - Sizing constants (chunk 250, sync cap 100, job cap 50k) are tuned for
   **Workers Free** limits — see `src/shared/constants.ts` before raising.
-- API key rotation, app activate/deactivate and quota changes take effect
+- API key rotation, app activate/deactivate, quota and IP allowlist changes take effect
   immediately (D1 is authoritative for auth — see ADR 0003). Global provider
   credential saves (ADR 0004) and per-app provider/masking changes made
   through the UI/API invalidate app caches (KV) instantly; anything else

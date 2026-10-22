@@ -19,6 +19,7 @@ import { readFlash } from "./flash";
 import {
   appActivePost,
   appConfigGet,
+  appIpAllowlistPost,
   appMaskingCreatePost,
   appMaskingDeletePost,
   appProvidersPost,
@@ -93,6 +94,7 @@ adminRoutes.get("/apps/:id/config", appConfigGet);
 adminRoutes.post("/apps/:id/active", appActivePost);
 adminRoutes.post("/apps/:id/rotate-key", appRotateKeyPost);
 adminRoutes.post("/apps/:id/providers", appProvidersPost);
+adminRoutes.post("/apps/:id/ip-allowlist", appIpAllowlistPost);
 adminRoutes.post("/apps/:id/quota", appQuotaPost);
 adminRoutes.post("/apps/:id/masking-profiles", appMaskingCreatePost);
 adminRoutes.post("/apps/:id/masking-profiles/:profileId/delete", appMaskingDeletePost);

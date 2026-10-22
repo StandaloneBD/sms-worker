@@ -36,6 +36,13 @@
       "when": 1792502236567,
       "tag": "0004_index_write_costs",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1792678410339,
+      "tag": "0005_app_ip_allowlist",
+      "breakpoints": true
     }
   ]
 }

@@ -7,7 +7,7 @@ code, API fields, and UI labels use these words.
 
 - **App** — An external service registered with the worker (e.g. the acadion
   backend). Authenticates with an API Key. Owns its provider preferences,
-  templates, masking profiles, and send history.
+  templates, masking profiles, Daily Quota, IP Allowlist, and send history.
 - **Admin** — A human operator who logs into the worker's UI to manage apps,
   providers, and view history. Changing an Admin's password signs out their
   other sessions.
@@ -55,6 +55,15 @@ code, API fields, and UI labels use these words.
   dispatching again.
 - **Daily Quota** — Optional per-App cap on recipients per UTC day across
   Sends and Jobs; requests that would exceed it are rejected with 429.
+- **Write Request** — An App API request that sends or changes what the App
+  will send: a Send, a Job, a Template create/update/delete, or a change to
+  its Priority. Every other App request (job progress, Messages, listing
+  Templates, Providers or Masking Profiles) is a read.
+- **IP Allowlist** — Optional per-App set of IPv4/IPv6 addresses and address
+  ranges (CIDR) from which the App's API Key may make Write Requests, with an
+  on/off switch; reads are allowed from anywhere. The set is kept while
+  switched off. An IPv6 range never covers an IPv4 caller, nor the reverse.
+  _Avoid_: whitelist, IP whitelist, IP restriction.
 - **Message** — The per-recipient history record of one attempted delivery:
   recipient (as the caller sent it), Provider used, status, reason, tracking
   id, timestamps.
@@ -65,6 +74,10 @@ code, API fields, and UI labels use these words.
   placeholder with no supplied variable renders as an empty string. A
   recipient's own `message` wins over the template, which wins over the
   request-level `message`.
+- **Required Template Token** — A placeholder a Send or Job names as
+  mandatory (e.g. an OTP's code): the Template must contain it as it is now,
+  and every recipient must supply a non-blank value for it, or the request is
+  rejected before anything is sent.
 - **Recipient** — A phone number as supplied by the App. Validated with
   `^\+?[0-9]{11,14}$`; never normalized centrally — each Provider adapts the
   number to its own wire format (MimSms requires `880...`).

@@ -141,6 +141,9 @@ export interface AuthedApp {
   /** Max recipients per UTC day; null/absent = unlimited. Absent on cache
    *  entries written before quotas existed. */
   dailyQuota?: number | null;
+  /** Addresses/ranges allowed to make write requests; absent = the IP
+   *  Allowlist is off and any address may. */
+  ipAllowlist?: string[];
 }
 
 /** Hono context bindings shared by all routes. */

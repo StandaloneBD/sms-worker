@@ -771,6 +771,18 @@ export async function setAppDailyQuota(db: Db, id: number, quota: number | null)
   return result.meta.changes > 0;
 }
 
+export async function setAppIpAllowlist(
+  db: Db,
+  id: number,
+  input: { enabled: boolean; entries: string[] },
+): Promise<boolean> {
+  const result = await db
+    .update(apps)
+    .set({ ipAllowlistEnabled: input.enabled, ipAllowlist: input.entries })
+    .where(eq(apps.id, id));
+  return result.meta.changes > 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Retention                                                            */
 /* ------------------------------------------------------------------ */

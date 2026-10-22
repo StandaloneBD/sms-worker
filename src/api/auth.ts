@@ -11,7 +11,7 @@ import { createMiddleware } from "hono/factory";
 import { getAppByKeyHash, getDb } from "../db";
 import { sha256Hex } from "../shared/crypto";
 import { AUTH_CACHE_TTL_SECONDS, kvAppByKeyHash } from "../shared/constants";
-import { writeAppAuthCache } from "../core/auth-cache";
+import { toAuthedApp, writeAppAuthCache } from "../core/auth-cache";
 import type { AppEnv, AuthedApp } from "../shared/types";
 
 function parseBearerToken(header: string | undefined): string | null {
@@ -37,7 +37,9 @@ function isAuthedApp(value: unknown): value is AuthedApp {
     Number.isSafeInteger(v.id) &&
     v.id > 0 &&
     typeof v.name === "string" &&
-    typeof v.isActive === "boolean"
+    typeof v.isActive === "boolean" &&
+    (v.ipAllowlist === undefined ||
+      (Array.isArray(v.ipAllowlist) && v.ipAllowlist.every((entry) => typeof entry === "string")))
   );
 }
 
@@ -90,7 +92,7 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
     if (!row) {
       return c.json({ error: "unauthorized" }, 401);
     }
-    authed = { id: row.id, name: row.name, isActive: row.isActive, dailyQuota: row.dailyQuota };
+    authed = toAuthedApp(row);
     c.executionCtx.waitUntil(syncAuthCache(c.env, hash, authed));
   } catch (err) {
     // D1 unreachable: fall back to the warm cache (outage shield, ADR 0003).

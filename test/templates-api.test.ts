@@ -1,19 +1,4 @@
-/**
- * Drives templatesRoutes (src/api/templates.ts) directly, with a fake-authed
- * `app` variable (see test/body-limit.test.ts for the same pattern), against
- * a REAL D1 binding (`env.DB` from `cloudflare:test`, per wrangler.jsonc).
- *
- * The test D1 database has no migrations applied, so the `templates` table
- * (and its `(app_id, name)` unique index) is created here from the exact DDL
- * in drizzle/0000_tiny_hercules.sql — split into individual statements since
- * D1's `.prepare()` takes one statement at a time. The `templates` table has
- * no FK to `apps` in that migration (`app_id` is a bare NOT NULL integer),
- * so no `apps` table setup is needed. Schema creation is idempotent
- * (`IF NOT EXISTS`) and re-run in `beforeEach` alongside a row wipe, so the
- * suite is correct whether or not the harness's "isolated per-test storage"
- * resets D1 between tests within this file.
- */
-
+import { resetDatabase } from "./helpers";
 import { env } from "cloudflare:test";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -32,26 +17,7 @@ interface TemplateRow {
   updatedAt: number;
 }
 
-async function ensureSchema() {
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS templates (
-      id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
-      app_id integer NOT NULL,
-      name text NOT NULL,
-      body text NOT NULL,
-      created_at integer NOT NULL,
-      updated_at integer NOT NULL
-    )`,
-  ).run();
-  await env.DB.prepare(
-    "CREATE UNIQUE INDEX IF NOT EXISTS templates_app_name_unique ON templates (app_id, name)",
-  ).run();
-  await env.DB.prepare("DELETE FROM templates").run();
-}
-
-beforeEach(async () => {
-  await ensureSchema();
-});
+beforeEach(resetDatabase);
 
 /** Builds a tiny Hono app stubbing `c.var.app` to the given id, mounting
  *  templatesRoutes, and converting thrown HTTPExceptions to `{error}` json

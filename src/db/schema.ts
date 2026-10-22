@@ -35,6 +35,12 @@ export const apps = sqliteTable("apps", {
   isActive: int("is_active", { mode: "boolean" }).notNull().default(true),
   /** Max recipients per UTC day across sends and jobs; null = unlimited. */
   dailyQuota: int("daily_quota"),
+  /** When on, only callers from ip_allowlist may make write requests (sends,
+   *  jobs, template and provider changes); reads stay open. */
+  ipAllowlistEnabled: int("ip_allowlist_enabled", { mode: "boolean" }).notNull().default(false),
+  /** JSON array of IPv4/IPv6 addresses and CIDR ranges; kept while the
+   *  allowlist is switched off. */
+  ipAllowlist: text("ip_allowlist", { mode: "json" }).$type<string[]>().notNull().default([]),
   createdAt: int("created_at").notNull(),
 });
 

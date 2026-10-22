@@ -1,6 +1,7 @@
 /**
  * App-facing API. Mounted by the orchestrator at `/v1`. Every route below
- * runs behind bearer auth (auth.ts); a single `onError` handler keeps error
+ * runs behind bearer auth (auth.ts), and write routes behind the App's IP
+ * Allowlist when it is on (ip-allowlist.ts); a single `onError` handler keeps error
  * responses consistently shaped as `{error: string}`, including turning a
  * malformed-JSON-body throw (see validate.ts `readJsonBody`) into 400
  * instead of the framework default 500.
@@ -9,6 +10,7 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { authMiddleware } from "./auth";
+import { ipAllowlistMiddleware } from "./ip-allowlist";
 import { providersRoutes } from "./providers";
 import { smsRoutes } from "./sms";
 import { templatesRoutes } from "./templates";
@@ -23,6 +25,7 @@ apiRoutes.use("*", async (c, next) => {
 });
 
 apiRoutes.use("*", authMiddleware);
+apiRoutes.use("*", ipAllowlistMiddleware);
 
 apiRoutes.route("/", smsRoutes);
 apiRoutes.route("/", templatesRoutes);

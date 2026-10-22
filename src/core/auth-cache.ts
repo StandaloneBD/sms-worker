@@ -6,8 +6,26 @@
  * best-effort, swallow-and-log, never throw or block the caller on KV.
  */
 
+import type { apps } from "../db/schema";
 import { AUTH_CACHE_TTL_SECONDS, kvAppByKeyHash } from "../shared/constants";
 import type { AuthedApp } from "../shared/types";
+
+type AppAuthFields = Pick<
+  typeof apps.$inferSelect,
+  "id" | "name" | "isActive" | "dailyQuota" | "ipAllowlistEnabled" | "ipAllowlist"
+>;
+
+/** The auth verdict for an apps row: what the API sees as c.var.app, and
+ *  what the KV shield caches. The allowlist is left out while it's off. */
+export function toAuthedApp(app: AppAuthFields): AuthedApp {
+  return {
+    id: app.id,
+    name: app.name,
+    isActive: app.isActive,
+    dailyQuota: app.dailyQuota,
+    ...(app.ipAllowlistEnabled ? { ipAllowlist: app.ipAllowlist } : {}),
+  };
+}
 
 export async function writeAppAuthCache(
   env: Env,

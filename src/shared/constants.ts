@@ -47,6 +47,10 @@ export const MAX_REASON_LENGTH = 500;
 /** Template name length cap. */
 export const MAX_TEMPLATE_NAME_LENGTH = 64;
 
+/** Max entries in an App's IP Allowlist. Every entry is checked on each
+ *  write request, and the list travels in the auth cache entry. */
+export const MAX_IP_ALLOWLIST_ENTRIES = 100;
+
 /** Max distinct keys accepted in one recipient's `vars` object. */
 export const MAX_VARS_KEYS = 20;
 
@@ -111,8 +115,14 @@ export const HISTORY_INSERT_ROWS = 10;
 /** Permissive phone validation ported from acadion (BD-flavored, not enforced). */
 export const PHONE_REGEX = /^\+?[0-9]{11,14}$/;
 
-/** Template placeholder token: %NAME% (uppercase alnum + underscore). */
-export const TEMPLATE_TOKEN_REGEX = /%([A-Z0-9_]+)%/g;
+/** Characters of a template token name (uppercase alnum + underscore). */
+const TEMPLATE_TOKEN_CHARS = "[A-Z0-9_]";
+
+/** Template placeholder token: %NAME%. */
+export const TEMPLATE_TOKEN_REGEX = new RegExp(`%(${TEMPLATE_TOKEN_CHARS}+)%`, "g");
+
+/** A bare token name as an API field names it (e.g. `requiredTemplateTokens`). */
+export const TEMPLATE_TOKEN_NAME_REGEX = new RegExp(`^${TEMPLATE_TOKEN_CHARS}{1,64}$`);
 
 /** KV cache keys + TTLs (seconds). D1 is source of truth; ADR 0002 makes the
  *  cache a send-path availability shield, hence the generous TTLs. */

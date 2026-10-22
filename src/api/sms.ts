@@ -25,7 +25,7 @@ import { buildDispatchPlan, maskingProfileExists } from "../core/plan";
 import { deleteJobObjects, encodeJobPayload, writeJobPayload } from "../core/payload";
 import { dispatch, toDispatchInput } from "../sms/dispatch";
 import { isValidPhone } from "../sms/phone";
-import { resolveBody } from "../sms/template";
+import { extractTokens, resolveBody } from "../sms/template";
 import {
   CHUNK_SIZE,
   MAX_BODY_BYTES,
@@ -34,6 +34,7 @@ import {
   MAX_REASON_LENGTH,
   MAX_SYNC_BODY_BYTES,
   MAX_SYNC_RECIPIENTS,
+  TEMPLATE_TOKEN_NAME_REGEX,
 } from "../shared/constants";
 import type {
   AppEnv,
@@ -61,6 +62,7 @@ export const smsRoutes = new Hono<AppEnv>();
 const QUEUE_SEND_BATCH_LIMIT = 100;
 /** Masking profile labels are 1-32 characters (Admin → Apps). */
 const MAX_MASKING_LABEL_LENGTH = 32;
+const MAX_REQUIRED_TOKENS = 20;
 
 interface SendFields {
   message?: string;
@@ -68,6 +70,7 @@ interface SendFields {
   maskingProfile?: string;
   maskingStrict?: boolean;
   recipients: unknown;
+  requiredTemplateTokens?: string[];
 }
 
 function parseSendFields(raw: unknown): SendFields {
@@ -100,6 +103,14 @@ function parseSendFields(raw: unknown): SendFields {
   if (obj.maskingStrict !== undefined && typeof obj.maskingStrict !== "boolean") {
     fail(400, `"maskingStrict" must be a boolean`);
   }
+  if (
+    obj.requiredTemplateTokens !== undefined &&
+    (!Array.isArray(obj.requiredTemplateTokens) ||
+      obj.requiredTemplateTokens.length > MAX_REQUIRED_TOKENS ||
+      obj.requiredTemplateTokens.some((token) => typeof token !== "string" || !TEMPLATE_TOKEN_NAME_REGEX.test(token)))
+  ) {
+    fail(400, `"requiredTemplateTokens" must be an array of at most ${MAX_REQUIRED_TOKENS} token names`);
+  }
 
   return {
     message: obj.message as string | undefined,
@@ -107,7 +118,26 @@ function parseSendFields(raw: unknown): SendFields {
     maskingProfile: obj.maskingProfile as string | undefined,
     maskingStrict: obj.maskingStrict as boolean | undefined,
     recipients: obj.recipients,
+    requiredTemplateTokens: obj.requiredTemplateTokens as string[] | undefined,
   };
+}
+
+/** `requiredTemplateTokens` (e.g. an OTP's code): each must be a placeholder
+ *  of the template as it is now and have a value for every recipient, so an
+ *  edited template can never send without it. */
+function assertRequiredTokens(
+  templateBody: string | undefined,
+  tokens: readonly string[] | undefined,
+  recipients: readonly RecipientInput[],
+): void {
+  if (!tokens?.length) return;
+  if (templateBody === undefined) fail(400, `"requiredTemplateTokens" needs a "templateId"`);
+  const available = new Set(extractTokens(templateBody));
+  for (const token of tokens) {
+    if (!available.has(token)) fail(400, `required template token "${token}" is not in the template`);
+    const index = recipients.findIndex((r) => r.message !== undefined || !r.vars?.[token]?.trim());
+    if (index >= 0) fail(400, `recipients[${index}]: required template token "${token}" has no value`);
+  }
 }
 
 async function loadTemplateBody(db: Db, appId: number, templateId: number | undefined): Promise<string | undefined> {
@@ -141,7 +171,7 @@ smsRoutes.post(
   "/sms/send",
   sendRateLimit,
   requestBodyLimit(MAX_SYNC_BODY_BYTES),
-  idempotency,
+  idempotency(),
   async (c) => {
     const db = getDb(c.env);
     const app = c.var.app;
@@ -160,6 +190,7 @@ smsRoutes.post(
       const problem = bodyProblem(body);
       return problem === null ? (body as string) : fail(400, `recipients[${index}]: ${problem}`);
     });
+    assertRequiredTokens(templateBody, fields.requiredTemplateTokens, normalized);
     await assertMaskingProfile(c, db, fields.maskingProfile);
 
     const validIndexes: number[] = [];
@@ -262,7 +293,9 @@ smsRoutes.post(
   "/sms/jobs",
   sendRateLimit,
   requestBodyLimit(MAX_BODY_BYTES),
-  idempotency,
+  // Jobs already require D1. Sending without a recorded retry key would let
+  // a lost response create a second Job on retry.
+  idempotency({ failClosed: true }),
   async (c) => {
     const db = getDb(c.env);
     const app = c.var.app;
@@ -285,6 +318,7 @@ smsRoutes.post(
     if (offending.length > 0) {
       return c.json({ error: "invalid recipients", indexes: offending.slice(0, 10) }, 400);
     }
+    assertRequiredTokens(templateBody, fields.requiredTemplateTokens, normalized);
     await assertMaskingProfile(c, db, fields.maskingProfile);
     await chargeDailyQuota(c, db, normalized.length);
 
