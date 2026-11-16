@@ -11,7 +11,7 @@ import { createMiddleware } from "hono/factory";
 import { getAppByKeyHash, getDb } from "../db";
 import { sha256Hex } from "../shared/crypto";
 import { AUTH_CACHE_TTL_SECONDS, kvAppByKeyHash } from "../shared/constants";
-import { toAuthedApp, writeAppAuthCache } from "../core/auth-cache";
+import { toAuthedApp, writeAppAuthCache, type AuthCacheMetadata } from "../core/auth-cache";
 import type { AppEnv, AuthedApp } from "../shared/types";
 
 function parseBearerToken(header: string | undefined): string | null {
@@ -23,12 +23,17 @@ function parseBearerToken(header: string | undefined): string | null {
 
 /** Key hash → the verdict this isolate last confirmed is in KV, and until
  *  when to trust that. Lets the request path skip KV while the outage shield
- *  is known to be current; re-checked at half the entry's TTL so it is
- *  refreshed before it expires. Bounded so a flood of distinct keys can't
- *  grow it unchecked. */
+ *  is known to be current. Bounded so a flood of distinct keys can't grow it
+ *  unchecked. */
 const confirmedInCache = new Map<string, { serialized: string; until: number }>();
 const CONFIRMED_CACHE_MAX = 1000;
-const CONFIRM_FOR_MS = (AUTH_CACHE_TTL_SECONDS * 1000) / 2;
+const AUTH_CACHE_TTL_MS = AUTH_CACHE_TTL_SECONDS * 1000;
+/** Longest an isolate goes without re-reading an entry it confirmed. */
+const CONFIRM_FOR_MS = AUTH_CACHE_TTL_MS / 2;
+/** An entry this close to expiry is rewritten, and one is trusted only up to
+ *  this long before its expiry, so the shield is renewed before it lapses
+ *  rather than up to CONFIRM_FOR_MS after. */
+const REFRESH_BEFORE_EXPIRY_MS = AUTH_CACHE_TTL_MS / 6;
 
 function isAuthedApp(value: unknown): value is AuthedApp {
   const v = value as AuthedApp | null;
@@ -61,20 +66,33 @@ async function readAuthCache(env: Env, hash: string): Promise<AuthedApp | null> 
 
 /** Brings the KV shield in line with D1, off the request path. Reads KV at
  *  most once per key per isolate per CONFIRM_FOR_MS, and writes only when the
- *  entry is missing or differs — KV writes must stay rare (Workers Free:
- *  1,000/day). Entries expire, so a write that races a key rotation can
- *  outlive it by at most AUTH_CACHE_TTL_SECONDS. */
+ *  entry is missing, differs, or is about to expire — KV writes must stay
+ *  rare (Workers Free: 1,000/day). Entries expire, so a write that races a
+ *  key rotation can outlive it by at most AUTH_CACHE_TTL_SECONDS. */
 async function syncAuthCache(env: Env, hash: string, authed: AuthedApp): Promise<void> {
   const serialized = JSON.stringify(authed);
   const now = Date.now();
   const confirmed = confirmedInCache.get(hash);
   if (confirmed && confirmed.serialized === serialized && confirmed.until > now) return;
-  const cached = await readAuthCache(env, hash);
-  if (!cached || JSON.stringify(cached) !== serialized) {
+
+  let expiresAt = 0;
+  try {
+    const { value, metadata } = await env.CACHE.getWithMetadata<AuthCacheMetadata>(kvAppByKeyHash(hash), "text");
+    // An entry written before metadata existed has an unknown expiry: rewrite it.
+    if (value === serialized && typeof metadata?.writtenAt === "number") {
+      expiresAt = metadata.writtenAt + AUTH_CACHE_TTL_MS;
+    }
+  } catch (err) {
+    console.warn(
+      JSON.stringify({ event: "auth_cache_get_failed", error: err instanceof Error ? err.message : String(err) }),
+    );
+  }
+  if (expiresAt - now < REFRESH_BEFORE_EXPIRY_MS) {
     await writeAppAuthCache(env, hash, authed);
+    expiresAt = now + AUTH_CACHE_TTL_MS;
   }
   if (confirmedInCache.size >= CONFIRMED_CACHE_MAX) confirmedInCache.clear();
-  confirmedInCache.set(hash, { serialized, until: now + CONFIRM_FOR_MS });
+  confirmedInCache.set(hash, { serialized, until: Math.min(now + CONFIRM_FOR_MS, expiresAt - REFRESH_BEFORE_EXPIRY_MS) });
 }
 
 export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {

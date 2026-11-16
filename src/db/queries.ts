@@ -39,7 +39,7 @@ export function isUniqueConstraintError(err: unknown): boolean {
   for (let e: unknown = err; e instanceof Error; e = e.cause) {
     // Drizzle's outer message includes SQL/parameters: an app named "Unique"
     // must not turn an unrelated D1 error into an apparent name conflict.
-    if (/^(?:D1_ERROR:s*)?UNIQUE constraint failed:/i.test(e.message)) return true;
+    if (/^(?:D1_ERROR:\s*)?UNIQUE constraint failed:/i.test(e.message)) return true;
   }
   return false;
 }
@@ -214,21 +214,6 @@ export async function getAppProviderPlan(
     .map((row) => ({ provider: row.provider, priority: row.priority }));
 }
 
-export async function upsertAppProvider(
-  db: Db,
-  input: { appId: number; provider: ProviderName; enabled: boolean; priority: number },
-) {
-  const rows = await db
-    .insert(appProviders)
-    .values(input)
-    .onConflictDoUpdate({
-      target: [appProviders.appId, appProviders.provider],
-      set: { enabled: input.enabled, priority: input.priority },
-    })
-    .returning();
-  return firstOrThrow(rows, "upsertAppProvider");
-}
-
 /** Saves an App's whole provider plan in one batch. */
 export async function upsertAppProviders(
   db: Db,
@@ -256,14 +241,6 @@ export async function listMaskingProfiles(db: Db, appId: number) {
     .from(maskingProfiles)
     .where(eq(maskingProfiles.appId, appId))
     .orderBy(asc(maskingProfiles.provider), asc(maskingProfiles.label));
-}
-
-export async function getMaskingProfiles(db: Db, appId: number, label: string) {
-  return db
-    .select()
-    .from(maskingProfiles)
-    .where(and(eq(maskingProfiles.appId, appId), eq(maskingProfiles.label, label)))
-    .orderBy(asc(maskingProfiles.provider));
 }
 
 export async function createMaskingProfile(
@@ -755,6 +732,15 @@ export async function consumeDailyQuota(
       setWhere: sql`${appUsage.recipients} + ${input.count} <= ${input.quota}`,
     });
   return result.meta.changes > 0;
+}
+
+/** Gives back `count` recipients charged by consumeDailyQuota, for a request
+ *  that failed before anything was sent or queued. */
+export async function refundDailyQuota(db: Db, input: { appId: number; day: string; count: number }): Promise<void> {
+  await db
+    .update(appUsage)
+    .set({ recipients: sql`max(0, ${appUsage.recipients} - ${input.count})` })
+    .where(and(eq(appUsage.appId, input.appId), eq(appUsage.day, input.day)));
 }
 
 export async function getAppUsage(db: Db, appId: number, day: string): Promise<number> {

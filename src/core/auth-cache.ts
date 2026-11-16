@@ -27,13 +27,21 @@ export function toAuthedApp(app: AppAuthFields): AuthedApp {
   };
 }
 
+/** KV metadata on an auth-cache entry: when it was written (ms), so a reader
+ *  knows when it expires — KV doesn't say. */
+export interface AuthCacheMetadata {
+  writtenAt: number;
+}
+
 export async function writeAppAuthCache(
   env: Env,
   keyHash: string,
   authed: AuthedApp,
 ): Promise<void> {
+  const metadata: AuthCacheMetadata = { writtenAt: Date.now() };
   await env.CACHE.put(kvAppByKeyHash(keyHash), JSON.stringify(authed), {
     expirationTtl: AUTH_CACHE_TTL_SECONDS,
+    metadata,
   }).catch((err: unknown) => {
     console.warn(
       JSON.stringify({ event: "auth_cache_write_failed", error: String(err) }),

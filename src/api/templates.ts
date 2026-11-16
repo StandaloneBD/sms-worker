@@ -4,7 +4,7 @@
 
 import { Hono } from "hono";
 import { createTemplate, deleteTemplate, getDb, isUniqueConstraintError, listTemplates, updateTemplate } from "../db";
-import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH } from "../shared/constants";
+import { templateBodyProblem, templateNameProblem } from "../sms/template";
 import type { AppEnv } from "../shared/types";
 import { fail, jsonObject, parseIdParam, readJsonBody } from "./validate";
 import { requestBodyLimit } from "../shared/body-limit";
@@ -13,17 +13,13 @@ export const templatesRoutes = new Hono<AppEnv>();
 templatesRoutes.use("*", requestBodyLimit(64 * 1024));
 
 function validateName(name: unknown): string {
-  if (typeof name !== "string" || name.length < 1 || name.length > MAX_TEMPLATE_NAME_LENGTH) {
-    return fail(400, `"name" must be 1-${MAX_TEMPLATE_NAME_LENGTH} characters`);
-  }
-  return name;
+  const problem = templateNameProblem(name);
+  return problem === null ? (name as string) : fail(400, problem);
 }
 
 function validateBody(body: unknown): string {
-  if (typeof body !== "string" || body.length < 1 || body.length > MAX_MESSAGE_LENGTH) {
-    return fail(400, `"body" must be 1-${MAX_MESSAGE_LENGTH} characters`);
-  }
-  return body;
+  const problem = templateBodyProblem(body);
+  return problem === null ? (body as string) : fail(400, problem);
 }
 
 templatesRoutes.get("/templates", async (c) => {

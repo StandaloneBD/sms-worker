@@ -5,7 +5,7 @@ import { getDb, isUniqueConstraintError } from "../../db";
 import { getAppById, getTemplate, updateTemplate } from "../../db/queries";
 import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH } from "../../shared/constants";
 import type { AppEnv } from "../../shared/types";
-import { extractTokens } from "../../sms/template";
+import { extractTokens, templateBodyProblem, templateNameProblem } from "../../sms/template";
 import { AppHeader, NotFoundPage, Panel, Segments } from "../components";
 import { redirectFlash, readFlash } from "../flash";
 import { Layout } from "../layout";
@@ -102,22 +102,8 @@ export async function templateEditPost(c: Context<AppEnv>): Promise<Response> {
   const name = formStr(body.name);
   const tplBody = formStr(body.body);
 
-  if (name.length < 1 || name.length > MAX_TEMPLATE_NAME_LENGTH) {
-    return redirectFlash(
-      c,
-      adminPath(`/apps/${id}/templates/${templateId}`),
-      `"name" must be 1-${MAX_TEMPLATE_NAME_LENGTH} characters`,
-      "error",
-    );
-  }
-  if (tplBody.length < 1 || tplBody.length > MAX_MESSAGE_LENGTH) {
-    return redirectFlash(
-      c,
-      adminPath(`/apps/${id}/templates/${templateId}`),
-      `"body" must be 1-${MAX_MESSAGE_LENGTH} characters`,
-      "error",
-    );
-  }
+  const problem = templateNameProblem(name) ?? templateBodyProblem(tplBody);
+  if (problem) return redirectFlash(c, adminPath(`/apps/${id}/templates/${templateId}`), problem, "error");
 
   let updated;
   try {

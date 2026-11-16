@@ -9,6 +9,7 @@
  *     terminal status (and becomes purgeable) eventually.
  *  2. Retention — a bounded slice of the purge: history and finished Jobs
  *     past RETENTION_DAYS, expired idempotency keys, old usage counters.
+ *     Skipped in a run whose reaper force-finished a chunk (D1 query budget).
  */
 
 import { getDb } from "../db";
@@ -48,22 +49,32 @@ export async function handleScheduled(
   _ctx: ExecutionContext,
 ): Promise<void> {
   const db = getDb(env);
-  await runStep("reaper", controller, () => reapStaleChunks(env, db));
+  const reaped = await runStep("reaper", controller, () => reapStaleChunks(env, db));
+  // A force-finish spends most of the invocation's D1 query budget; the
+  // purge is bounded and catches up on the next run.
+  if (reaped && reaped.forceFinished > 0) {
+    console.log(
+      JSON.stringify({ event: "retention_purge_skipped", ts: nowSeconds(), cron: controller.cron, reason: "reaper force-finished a chunk" }),
+    );
+    return;
+  }
   await runStep("retention_purge", controller, () => purgeExpired(db));
 }
 
-async function runStep(
+async function runStep<T extends Record<string, number>>(
   name: string,
   controller: ScheduledController,
-  step: () => Promise<Record<string, number>>,
-): Promise<void> {
+  step: () => Promise<T>,
+): Promise<T | undefined> {
   try {
     const counts = await step();
     console.log(JSON.stringify({ event: `${name}_completed`, ts: nowSeconds(), cron: controller.cron, ...counts }));
+    return counts;
   } catch (err) {
     console.error(
       JSON.stringify({ event: `${name}_failed`, ts: nowSeconds(), cron: controller.cron, error: errorMessage(err) }),
     );
+    return undefined;
   }
 }
 

@@ -97,9 +97,13 @@ export const SEND_RETRY_BASE_SECONDS = 60;
 export const CHUNK_STALE_SECONDS = 2 * 60 * 60;
 /** Re-enqueues of one chunk before the reaper fails it outright. */
 export const CHUNK_MAX_REQUEUES = 3;
-/** Chunks re-enqueued / force-failed per cron run (D1 query budget). */
+/** Chunks re-enqueued / force-failed per cron run (D1 query budget).
+ *  Force-finishing a full chunk costs ~30 queries (its history alone is
+ *  CHUNK_SIZE / HISTORY_INSERT_ROWS = 25 inserts), so only one fits in the
+ *  Free plan's 50 per invocation, and a run that force-finishes one skips
+ *  the retention purge. */
 export const REAPER_REQUEUE_BATCH = 50;
-export const REAPER_FAIL_BATCH = 5;
+export const REAPER_FAIL_BATCH = 1;
 
 /** Retention purge, per table per cron run: up to PURGE_MAX_BATCHES deletes
  *  of PURGE_BATCH_ROWS rows each, so one run stays inside the D1 query and

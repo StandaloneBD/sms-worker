@@ -46,10 +46,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function truncateReason(reason: string): string {
-  return reason.length > MAX_REASON_LENGTH ? reason.slice(0, MAX_REASON_LENGTH) : reason;
-}
-
 /** Infrastructure-error backoff: RETRY_BASE_SECONDS * 2^attempts, capped. */
 function backoffSeconds(attempts: number): number {
   return Math.min(RETRY_BASE_SECONDS * 2 ** attempts, RETRY_MAX_SECONDS);
@@ -181,7 +177,7 @@ function settleRound(
     body: target.storeBody ? (target.body ?? null) : null,
     provider: null,
     status: "failed",
-    reason: truncateReason(reason),
+    reason: reason.slice(0, MAX_REASON_LENGTH),
     trackingId: null,
   });
 
@@ -222,7 +218,7 @@ function settleRound(
       body: target.storeBody ? target.body : null,
       provider: outcome.provider,
       status: outcome.accepted ? "sent" : "failed",
-      reason: outcome.reason ? truncateReason(outcome.reason) : null,
+      reason: outcome.reason ? outcome.reason.slice(0, MAX_REASON_LENGTH) : null,
       trackingId: outcome.trackingId ?? null,
     });
   }
