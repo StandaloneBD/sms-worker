@@ -410,7 +410,7 @@ async function renderAppConfig(
             </div>
             <div class="form-row">
               <div class="field">
-                <label for="mp-sender-id">Sender ID (BulkSMSBD)</label>
+                <label for="mp-sender-id">Sender ID (BulkSMSBD, WhiteInfoBD)</label>
                 <input class="input mono" type="text" id="mp-sender-id" name="senderId" />
               </div>
               <div class="field">

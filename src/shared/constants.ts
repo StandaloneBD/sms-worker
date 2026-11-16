@@ -14,6 +14,18 @@ export const MAX_JOB_RECIPIENTS = 50_000;
 export const MAX_SYNC_RECIPIENTS = 100;
 
 /**
+ * Most HTTP requests one provider adapter makes for a single dispatch call.
+ * Only binds for a provider without a many-to-many endpoint (WhiteInfoBD),
+ * which needs a request per distinct body on a dynamic send: a 250-recipient
+ * chunk of rendered templates would otherwise blow the Free plan's 50
+ * subrequests per invocation. 40 leaves room for the other providers in the
+ * failover chain. Recipients beyond the budget are declined retryably, so
+ * dispatch hands them to the next provider and a Job retries them in its next
+ * send round (ADR 0007).
+ */
+export const MAX_PROVIDER_REQUESTS_PER_DISPATCH = 40;
+
+/**
  * Max accepted JSON body for a sync /sms/send request. Derived from the
  * worst legitimate shape: MAX_SYNC_RECIPIENTS (100) recipients, each up to
  * ~1 KB of message text (MAX_MESSAGE_LENGTH) plus its `to` string and a

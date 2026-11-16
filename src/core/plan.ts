@@ -18,6 +18,7 @@ import { KV_APP_CONFIG_PREFIX, KV_TTL_SECONDS, kvAppConfig } from "../shared/con
 import type { DispatchPlanEntry, ProviderName } from "../shared/types";
 import { BulkSmsBd } from "../sms/bulksmsbd";
 import { MimSms } from "../sms/mimsms";
+import { WhiteInfoBd } from "../sms/whiteinfobd";
 import { FakeSms } from "../sms/fake";
 
 interface CachedProfile {
@@ -164,13 +165,14 @@ export async function buildDispatchPlan(
         continue;
       }
 
-      if (item.provider === "bulksmsbd") {
+      if (item.provider === "bulksmsbd" || item.provider === "whiteinfobd") {
         const senderId = profile?.senderId ?? global?.senderId;
         if (!senderId) {
-          warnings.push("bulksmsbd omitted: no sender id configured");
+          warnings.push(`${item.provider} omitted: no sender id configured`);
           continue;
         }
-        entries.push({ provider: new BulkSmsBd({ apiKey, senderId }) });
+        const Adapter = item.provider === "bulksmsbd" ? BulkSmsBd : WhiteInfoBd;
+        entries.push({ provider: new Adapter({ apiKey, senderId }) });
       } else {
         const username = profile?.username ?? global?.username;
         const senderName = profile?.senderName ?? global?.senderName;

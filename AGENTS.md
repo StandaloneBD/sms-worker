@@ -1,6 +1,6 @@
 # sms-worker
 
-Cloudflare Worker that sends SMS for registered apps through BulkSMSBD and MiMSMS, with an admin UI.
+Cloudflare Worker that sends SMS for registered apps through BulkSMSBD, MiMSMS and WhiteInfoBD, with an admin UI.
 README.md covers setup and the HTTP API. CONTEXT.md is the glossary: use its terms in code, API
 fields and UI labels. docs/adr/ records design decisions; read the relevant ADR before changing
 auth caching, provider credentials, or send rounds.

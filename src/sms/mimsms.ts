@@ -5,22 +5,10 @@ import type {
   SmsSendOutcome,
 } from "../shared/types";
 import { detailOf, failureOf } from "./errors";
-import { postProviderJson } from "./http";
+import { postProviderJson, providerTimeoutFor } from "./http";
 
 const ONE_TO_MANY_URL = "https://api.mimsms.com/api/V2/OneToMany";
 const DYNAMIC_SMS_URL = "https://api.mimsms.com/api/V2/DSMS";
-
-const BASE_TIMEOUT_MS = 10_000;
-const MAX_TIMEOUT_MS = 30_000;
-
-/**
- * A batch of 1000 needs longer than a single send, but an unbounded timeout
- * would stall a dispatch behind a dead provider. A chunk that times out is
- * ambiguous — it fails over and may duplicate — so the allowance grows with
- * the recipient count rather than staying at the single-send 10s.
- */
-const timeoutFor = (recipientCount: number): number =>
-  Math.min(MAX_TIMEOUT_MS, BASE_TIMEOUT_MS + recipientCount * 25);
 
 /**
  * Provider-documented ceiling on recipients per request. Larger sends are split
@@ -72,12 +60,13 @@ function recipientKey(number: string): string {
 }
 
 /**
+ * Best-effort `{ number, reason }` from an `error_Data` element of unknown shape.
+ *
  * Every published MiMSMS example returns `error_Data: []`, so the element shape
  * is unverified — it may not even be an object. Parsing is deliberately
  * defensive: an entry we cannot read is still accounted for as a failure, and
  * never crashes the dispatch.
  */
-/** Best-effort `{ number, reason }` from an `error_Data` element of unknown shape. */
 function readErrorEntry(entry: unknown): { number: string; reason: string } | null {
   if (typeof entry === "string") {
     return { number: entry, reason: "provider rejected recipient" };
@@ -189,7 +178,7 @@ export class MimSms implements ISmsProvider {
       );
 
       try {
-        const body = await this.post(url, buildPayload(chunk), timeoutFor(numbers.length));
+        const body = await this.post(url, buildPayload(chunk), providerTimeoutFor(numbers.length));
         outcomes.push(...this.mapOutcomes(numbers, body));
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);

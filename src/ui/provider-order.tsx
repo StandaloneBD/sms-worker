@@ -14,6 +14,7 @@ import { adminPath } from "./paths";
 export const PROVIDER_LABELS: Record<ProviderName, string> = {
   bulksmsbd: "BulkSMSBD",
   mimsms: "MimSms",
+  whiteinfobd: "WhiteInfoBD",
 };
 
 // Also in public/admin/provider-order.js, which relabels rows after a drag.

@@ -2,11 +2,11 @@
 
 Standalone SMS gateway on Cloudflare Workers. Any backend ("App") registers
 once, gets an API key, and sends SMS through a provider-failover pipeline
-(BulkSMSBD → MiMSMS by default) with per-recipient history in D1, bulk jobs
-via Queues + R2 with retries for provider outages, `%TOKEN%` templating,
-per-app provider priorities, per-app masking profiles (custom sender
-identity / credentials), idempotency keys, and per-app rate limits and
-daily quotas.
+(BulkSMSBD, MiMSMS, WhiteInfoBD, in per-app order) with per-recipient
+history in D1, bulk jobs via Queues + R2 with retries for provider outages,
+`%TOKEN%` templating, per-app provider priorities, per-app masking profiles
+(custom sender identity / credentials), idempotency keys, and per-app rate
+limits and daily quotas.
 
 Domain language: [CONTEXT.md](./CONTEXT.md). Key decisions:
 [docs/adr/](./docs/adr/).
@@ -131,10 +131,16 @@ Firefox accept it on `http://localhost`, Safari may not.
 
 Provider credentials are not worker secrets — after first login, open
 Admin → Providers and enter each provider's API key and sender identity
-(sender id for BulkSMSBD; username + sender name for MiMSMS). They're stored
-AES-GCM-encrypted in D1 (`ENCRYPTION_KEY`) and changes apply immediately.
-Disabling a provider there is a kill switch: no app dispatches through it,
-whatever its own provider plan says.
+(sender id for BulkSMSBD and WhiteInfoBD; username + sender name for
+MiMSMS). They're stored AES-GCM-encrypted in D1 (`ENCRYPTION_KEY`) and
+changes apply immediately. Disabling a provider there is a kill switch: no
+app dispatches through it, whatever its own provider plan says. A provider
+added in a new release starts disabled; enable it there.
+
+WhiteInfoBD only accepts calls from whitelisted server IPs (otherwise every
+call is refused with code 2003), and a Worker has no fixed outbound IP: have
+WhiteInfoBD turn the check off for the account, or allow Cloudflare's
+published ranges, before enabling it.
 Local dev runs with `FAKE_SMS=true`, so no credentials are needed; to hit
 real providers locally, set `FAKE_SMS=false` in `.dev.vars` and enter
 credentials in the UI.
@@ -246,6 +252,11 @@ See ADR 0006.
   ADR 0005.
 - Phone numbers: `^\+?[0-9]{11,14}$`, stored as given; MiMSMS 880-prefixing
   happens inside its adapter only.
+- WhiteInfoBD has no many-to-many endpoint, so a dynamic send through it
+  costs one request per distinct body, at most 40 per dispatch (Workers Free
+  allows 50 subrequests per invocation). The rest fail over to the next
+  provider, or wait for the Job's next send round (ADR 0007). Put it after a
+  provider with a dynamic endpoint if you send templated bulk.
 - Sizing constants (chunk 250, sync cap 100, job cap 50k) are tuned for
   **Workers Free** limits — see `src/shared/constants.ts` before raising.
 - API key rotation, app activate/deactivate, quota and IP allowlist changes take effect
