@@ -3,7 +3,7 @@
  * these types, so changes here ripple everywhere — extend, don't reshape.
  */
 
-export const PROVIDER_NAMES = ["bulksmsbd", "mimsms"] as const;
+export const PROVIDER_NAMES = ["bulksmsbd", "mimsms", "whiteinfobd"] as const;
 export type ProviderName = (typeof PROVIDER_NAMES)[number];
 
 /**
@@ -40,7 +40,7 @@ export interface SmsDynamicMessage {
  */
 export interface ProviderCredentials {
   apiKey: string;
-  /** bulksmsbd: numeric sender id. */
+  /** bulksmsbd: numeric sender id. whiteinfobd: approved sender id (masking or non-masking). */
   senderId?: string;
   /** mimsms only. */
   username?: string;

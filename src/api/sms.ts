@@ -21,7 +21,7 @@ import {
   type Db,
   type NewMessageRow,
 } from "../db";
-import { buildDispatchPlan, maskingProfileExists } from "../core/plan";
+import { buildDispatchPlan, maskingProfileExists, type BuiltPlan } from "../core/plan";
 import { deleteJobObjects, encodeJobPayload, writeJobPayload } from "../core/payload";
 import { dispatch, toDispatchInput } from "../sms/dispatch";
 import { isValidPhone } from "../sms/phone";
@@ -52,7 +52,6 @@ import {
   normalizeRecipients,
   parseQueryInt,
   readJsonBody,
-  truncate,
   type RecipientInput,
 } from "./validate";
 
@@ -197,15 +196,21 @@ smsRoutes.post(
     normalized.forEach((recipient, index) => {
       if (isValidPhone(recipient.to)) validIndexes.push(index);
     });
-    await chargeDailyQuota(c, db, validIndexes.length);
+    const refundQuota = await chargeDailyQuota(c, db, validIndexes.length);
 
     const dispatchInput = toDispatchInput(
       validIndexes.map((i) => ({ to: (normalized[i] as RecipientInput).to, body: bodies[i] as string })),
     );
-    const { entries, warnings } =
-      validIndexes.length > 0
-        ? await buildDispatchPlan(c.env, db, app.id, fields.maskingProfile, { maskingStrict: fields.maskingStrict })
-        : { entries: [], warnings: [] };
+    let plan: BuiltPlan = { entries: [], warnings: [] };
+    if (validIndexes.length > 0) {
+      try {
+        plan = await buildDispatchPlan(c.env, db, app.id, fields.maskingProfile, { maskingStrict: fields.maskingStrict });
+      } catch (err) {
+        await refundQuota();
+        throw err;
+      }
+    }
+    const { entries, warnings } = plan;
     const dispatchResults = validIndexes.length > 0 ? await dispatch(entries, dispatchInput) : [];
 
     const results: DispatchResultItem[] = normalized.map((recipient) => ({
@@ -263,7 +268,7 @@ smsRoutes.post(
               body: templateBody !== undefined || recipient.message !== undefined ? (bodies[index] ?? null) : null,
               provider: result.provider ?? null,
               status: result.accepted ? "sent" : "failed",
-              reason: result.reason ? truncate(result.reason, MAX_REASON_LENGTH) : null,
+              reason: result.reason ? result.reason.slice(0, MAX_REASON_LENGTH) : null,
               trackingId: result.trackingId ?? null,
             };
           });
@@ -320,7 +325,7 @@ smsRoutes.post(
     }
     assertRequiredTokens(templateBody, fields.requiredTemplateTokens, normalized);
     await assertMaskingProfile(c, db, fields.maskingProfile);
-    await chargeDailyQuota(c, db, normalized.length);
+    const refundQuota = await chargeDailyQuota(c, db, normalized.length);
 
     const jobId = crypto.randomUUID();
     // The consumer resolves each body with the same resolveBody() rule, so
@@ -343,7 +348,12 @@ smsRoutes.post(
       ...(recipient.vars !== undefined ? { vars: recipient.vars } : {}),
     }));
     const { body: payload, chunks } = encodeJobPayload(header, payloadRecipients, CHUNK_SIZE);
-    await writeJobPayload(c.env, jobId, payload);
+    try {
+      await writeJobPayload(c.env, jobId, payload);
+    } catch (err) {
+      await refundQuota();
+      throw err;
+    }
 
     try {
       await insertBulkJob(
@@ -374,6 +384,7 @@ smsRoutes.post(
           error: err instanceof Error ? err.message : String(err),
         }),
       );
+      await refundQuota();
       return fail(503, "job could not be recorded; try again");
     }
 

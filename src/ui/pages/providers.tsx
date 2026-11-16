@@ -24,6 +24,9 @@ import {
 } from "../provider-order";
 import { formChecked, formStr, formatTs, parseIntOr, providerCredentialError } from "../util";
 
+/** Providers whose sender identity is a sender id (MimSms uses username + sender name). */
+const usesSenderId = (provider: ProviderName): boolean => provider === "bulksmsbd" || provider === "whiteinfobd";
+
 export async function providersGet(c: Context<AppEnv>): Promise<Response> {
   const db = getDb(c.env);
   // Listed in priority order, which is the order sends try them in.
@@ -55,7 +58,7 @@ export async function providersGet(c: Context<AppEnv>): Promise<Response> {
                   </div>
 
                   <div class="prov-fields">
-                    {row.provider === "bulksmsbd" ? (
+                    {usesSenderId(row.provider) ? (
                       <div class="field">
                         <label for={id("sender-id")}>Sender ID</label>
                         <input
@@ -64,7 +67,7 @@ export async function providersGet(c: Context<AppEnv>): Promise<Response> {
                           id={id("sender-id")}
                           name={`${row.provider}_senderId`}
                           value={row.senderId ?? ""}
-                          placeholder="Numeric sender ID"
+                          placeholder={row.provider === "bulksmsbd" ? "Numeric sender ID" : "Approved sender ID"}
                         />
                       </div>
                     ) : null}
@@ -172,7 +175,7 @@ export async function providersPost(c: Context<AppEnv>): Promise<Response> {
       provider,
       enabled,
       priority,
-      senderId: provider === "bulksmsbd" ? senderIdRaw || null : null,
+      senderId: usesSenderId(provider) ? senderIdRaw || null : null,
       username: provider === "mimsms" ? usernameRaw || null : null,
       senderName: provider === "mimsms" ? senderNameRaw || null : null,
       apiKeyEnc,

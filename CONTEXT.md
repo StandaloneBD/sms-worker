@@ -16,8 +16,9 @@ code, API fields, and UI labels use these words.
   Rotation and deactivation take effect immediately when D1 is reachable;
   during a D1 outage the last cached auth verdict (≤ 300 s old) is used.
 - **Provider** — An external SMS gateway the worker can dispatch through.
-  Currently `bulksmsbd` and `mimsms`. Disabling a Provider globally is a kill
-  switch: no App dispatches through it, whatever its own Priority says.
+  Currently `bulksmsbd`, `mimsms` and `whiteinfobd`. Disabling a Provider
+  globally is a kill switch: no App dispatches through it, whatever its own
+  Priority says.
 - **Priority** — Per-App ordering of enabled Providers. Dispatch tries
   Providers in priority order.
 - **Masking Profile** — A per-App override of a Provider's credentials and
@@ -81,6 +82,11 @@ code, API fields, and UI labels use these words.
 - **Recipient** — A phone number as supplied by the App. Validated with
   `^\+?[0-9]{11,14}$`; never normalized centrally — each Provider adapts the
   number to its own wire format (MimSms requires `880...`).
+- **Uniform / dynamic send** — A Send or Job whose recipients all get the
+  same body is uniform (one-to-many request); otherwise it is dynamic. A
+  Provider without a many-to-many endpoint (WhiteInfoBD) spends a request per
+  distinct body on a dynamic send, capped per Dispatch; recipients over the
+  cap fail over to the next Provider or a later Send Round (ADR 0007).
 
 ## Statuses
 

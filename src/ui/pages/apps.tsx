@@ -54,6 +54,7 @@ import {
   rankCounter,
 } from "../provider-order";
 import { formChecked, formatTs, formStr, parseId, parseIntOr, providerCredentialError } from "../util";
+import { templateBodyProblem, templateNameProblem } from "../../sms/template";
 
 function isProviderName(value: string): value is ProviderName {
   return (PROVIDER_NAMES as readonly string[]).includes(value);
@@ -410,7 +411,7 @@ async function renderAppConfig(
             </div>
             <div class="form-row">
               <div class="field">
-                <label for="mp-sender-id">Sender ID (BulkSMSBD)</label>
+                <label for="mp-sender-id">Sender ID (BulkSMSBD, WhiteInfoBD)</label>
                 <input class="input mono" type="text" id="mp-sender-id" name="senderId" />
               </div>
               <div class="field">
@@ -752,22 +753,8 @@ export async function appTemplateCreatePost(c: Context<AppEnv>): Promise<Respons
   const name = formStr(body.name);
   const tplBody = formStr(body.body);
 
-  if (name.length < 1 || name.length > MAX_TEMPLATE_NAME_LENGTH) {
-    return redirectFlash(
-      c,
-      appPath(id, "config"),
-      `"name" must be 1-${MAX_TEMPLATE_NAME_LENGTH} characters`,
-      "error",
-    );
-  }
-  if (tplBody.length < 1 || tplBody.length > MAX_MESSAGE_LENGTH) {
-    return redirectFlash(
-      c,
-      appPath(id, "config"),
-      `"body" must be 1-${MAX_MESSAGE_LENGTH} characters`,
-      "error",
-    );
-  }
+  const problem = templateNameProblem(name) ?? templateBodyProblem(tplBody);
+  if (problem) return redirectFlash(c, appPath(id, "config"), problem, "error");
 
   let created;
   try {

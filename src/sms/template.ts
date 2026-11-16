@@ -1,4 +1,18 @@
-import { TEMPLATE_TOKEN_REGEX } from "../shared/constants";
+import { MAX_MESSAGE_LENGTH, MAX_TEMPLATE_NAME_LENGTH, TEMPLATE_TOKEN_REGEX } from "../shared/constants";
+
+/** Why a Template name can't be saved, or null. Shared by the API and the admin UI. */
+export function templateNameProblem(name: unknown): string | null {
+  return typeof name === "string" && name.length >= 1 && name.length <= MAX_TEMPLATE_NAME_LENGTH
+    ? null
+    : `"name" must be 1-${MAX_TEMPLATE_NAME_LENGTH} characters`;
+}
+
+/** Why a Template body can't be saved, or null. Shared by the API and the admin UI. */
+export function templateBodyProblem(body: unknown): string | null {
+  return typeof body === "string" && body.length >= 1 && body.length <= MAX_MESSAGE_LENGTH
+    ? null
+    : `"body" must be 1-${MAX_MESSAGE_LENGTH} characters`;
+}
 
 /**
  * Renders `%TOKEN%` placeholders against `vars`. A placeholder with no

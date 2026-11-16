@@ -34,5 +34,5 @@ it("a partial per-app override renders inherited providers as disabled", async (
   const res = await request([{ provider: "bulksmsbd", enabled: true, priority: 2 }]);
   expect(res.status).toBe(200);
   expect(await getAppProviderPlan(db, 1)).toEqual([{ provider: "bulksmsbd", priority: 2 }]);
-  expect(await getAppProviderRows(db, 1)).toMatchObject([{ provider: "bulksmsbd", enabled: true }, { provider: "mimsms", enabled: false }]);
+  expect(await getAppProviderRows(db, 1)).toMatchObject([{ provider: "bulksmsbd", enabled: true }, { provider: "mimsms", enabled: false }, { provider: "whiteinfobd", enabled: false }]);
 });

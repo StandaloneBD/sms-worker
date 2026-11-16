@@ -6,18 +6,12 @@
 
 import { and, asc, desc, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "../db/queries";
-import { getGlobalProviders, listApps } from "../db/queries";
+import { getGlobalProviders } from "../db/queries";
 import { admins, appProviders, jobs, messages } from "../db/schema";
 import { PROVIDER_NAMES } from "../shared/types";
 import type { ProviderName } from "../shared/types";
 
 const DAY_SECONDS = 86400;
-
-/** appId -> app name, for decorating job/message rows with a readable label. */
-export async function appNameMap(db: Db): Promise<Map<number, string>> {
-  const apps = await listApps(db);
-  return new Map(apps.map((a) => [a.id, a.name]));
-}
 
 /** Admin row by id. db/queries only exposes lookup by username; the settings
  *  page (change own password) needs the current admin's row by session id. */

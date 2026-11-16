@@ -5,7 +5,7 @@ import type {
   SmsSendOutcome,
 } from "../shared/types";
 import { detailOf, failureOf } from "./errors";
-import { postProviderJson } from "./http";
+import { postProviderJson, providerTimeoutFor } from "./http";
 
 const SMS_URL = "https://bulksmsbd.net/api/smsapi";
 const SMS_MANY_URL = "https://bulksmsbd.net/api/smsapimany";
@@ -25,11 +25,6 @@ const FORM_CONTENT_TYPE = "application/x-www-form-urlencoded";
 
 /** Undocumented by the provider; kept conservative and in step with MimSms. */
 const MAX_RECIPIENTS_PER_REQUEST = 1000;
-
-const BASE_TIMEOUT_MS = 10_000;
-const MAX_TIMEOUT_MS = 30_000;
-const timeoutFor = (recipientCount: number): number =>
-  Math.min(MAX_TIMEOUT_MS, BASE_TIMEOUT_MS + recipientCount * 25);
 
 type BulkSmsBdResponse = {
   response_code?: number | string;
@@ -121,7 +116,7 @@ export class BulkSmsBd implements ISmsProvider {
 
       let outcome: SmsSendOutcome;
       try {
-        outcome = await this.sendPost(url, contentType, body, timeoutFor(chunk.length), {
+        outcome = await this.sendPost(url, contentType, body, providerTimeoutFor(chunk.length), {
           recipientCount: chunk.length,
           messageLength,
         });

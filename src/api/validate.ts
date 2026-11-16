@@ -35,10 +35,6 @@ export function jsonObject(raw: unknown): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 
-export function truncate(text: string, maxLength: number): string {
-  return text.length > maxLength ? text.slice(0, maxLength) : text;
-}
-
 /** One recipient as accepted in a request body: a bare phone string, or an object. */
 export interface RecipientInput {
   to: string;

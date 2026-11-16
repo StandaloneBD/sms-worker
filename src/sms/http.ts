@@ -4,6 +4,29 @@ const MAX_RESPONSE_BYTES = 256 * 1024;
 /** How much of an error or unparseable body is kept for the logs. */
 const MAX_DETAIL_CHARS = 1000;
 
+const BASE_TIMEOUT_MS = 10_000;
+const MAX_TIMEOUT_MS = 30_000;
+
+/**
+ * Request timeout for a provider call carrying `recipientCount` recipients.
+ * A batch of 1000 needs longer than a single send, but an unbounded timeout
+ * would stall a dispatch behind a dead provider. A request that times out is
+ * ambiguous — it fails over and may duplicate — so the allowance grows with
+ * the recipient count rather than staying at the single-send 10s.
+ */
+export const providerTimeoutFor = (recipientCount: number): number =>
+  Math.min(MAX_TIMEOUT_MS, BASE_TIMEOUT_MS + recipientCount * 25);
+
+export interface ProviderJsonOptions {
+  /**
+   * Return the JSON object body of a refusal (a non-2xx that
+   * `failureForStatus` classes as "provider", e.g. 401/422) instead of
+   * throwing, for providers that put their error code on an HTTP error. A
+   * refusal whose body isn't a JSON object still throws.
+   */
+  jsonRefusals?: boolean;
+}
+
 /**
  * POSTs to a provider and returns its JSON object response. The deadline
  * covers headers AND body consumption, and the body is capped at
@@ -25,6 +48,7 @@ export async function postProviderJson(
   body: string | URLSearchParams,
   headers: Record<string, string>,
   timeoutMs: number,
+  options: ProviderJsonOptions = {},
 ): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -38,11 +62,16 @@ export async function postProviderJson(
       });
     }
     if (!response.ok) {
+      const failure = failureForStatus(response.status);
       // The status is the answer; an unreadable body must not turn it into a
       // generic transport failure.
       const { text } = await readCapped(response.body, MAX_DETAIL_CHARS).catch(() => ({ text: "(body unreadable)" }));
+      if (options.jsonRefusals && failure === "provider") {
+        const value = parseJsonObject(text);
+        if (value) return value;
+      }
       throw new ProviderTransportError(`${provider} request failed with status ${response.status}`, {
-        failure: failureForStatus(response.status),
+        failure,
         detail: text,
       });
     }
@@ -56,21 +85,13 @@ export async function postProviderJson(
     if (truncated) {
       throw new ProviderTransportError(`${provider} response body too large`, { detail: text.slice(0, MAX_DETAIL_CHARS) });
     }
-    let value: unknown;
-    try {
-      value = JSON.parse(text);
-    } catch (err) {
-      throw new ProviderTransportError(`${provider} response is not JSON`, {
-        cause: err,
+    const value = parseJsonObject(text);
+    if (!value) {
+      throw new ProviderTransportError(`${provider} response is not a JSON object`, {
         detail: text.slice(0, MAX_DETAIL_CHARS),
       });
     }
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new ProviderTransportError(`${provider} response must be a JSON object`, {
-        detail: text.slice(0, MAX_DETAIL_CHARS),
-      });
-    }
-    return value as Record<string, unknown>;
+    return value;
   } catch (err) {
     if (err instanceof ProviderTransportError) throw err;
     if (controller.signal.aborted) {
@@ -82,6 +103,15 @@ export async function postProviderJson(
     });
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  } catch {
+    return null;
   }
 }
 

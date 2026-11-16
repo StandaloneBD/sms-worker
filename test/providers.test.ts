@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BulkSmsBd } from "../src/sms/bulksmsbd";
 import { MimSms } from "../src/sms/mimsms";
+import { WhiteInfoBd } from "../src/sms/whiteinfobd";
+import { MAX_PROVIDER_REQUESTS_PER_DISPATCH } from "../src/shared/constants";
 import { dispatch } from "../src/sms/dispatch";
 import { postProviderJson } from "../src/sms/http";
 import { renderTemplate } from "../src/sms/template";
@@ -9,6 +11,7 @@ import type { ISmsProvider } from "../src/shared/types";
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 const mim = () => new MimSms({ apiKey: "test-key", username: "test-user", senderName: "test-sender" });
 const bulk = () => new BulkSmsBd({ apiKey: "test-key", senderId: "test-sender" });
+const white = () => new WhiteInfoBd({ apiKey: "test-key", senderId: "test-sender" });
 
 describe("provider failover", () => {
   it("bounds provider failure reasons before replicating them into the API result", async () => {
@@ -47,6 +50,53 @@ describe("MiMSMS response attribution", () => {
   it("unreadable entries cannot crash a batch that has known successes", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ statusCode: "200", status: "success", success_Data: [null, { mobNumber: 123 }, { mobNumber: "8801712345678", trackingId: "ok" }], error_Data: [null, { to: 42, message: { bad: true } }] })));
     expect(await mim().send(["01712345678"], "hi")).toEqual([{ accepted: true, trackingId: "ok" }]);
+  });
+});
+
+describe("WhiteInfoBD dynamic sends", () => {
+  type SentBody = { sender_id: string; numbers: string; body: string };
+  const sentBodies = (fetch: ReturnType<typeof vi.fn>) =>
+    fetch.mock.calls.map((call) => JSON.parse((call[1] as RequestInit).body as string) as SentBody);
+
+  it("shares a request between recipients with the same body and restores caller order", async () => {
+    let batch = 0;
+    const fetch = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => Response.json({ status: "processing", code: 1000, message_id: `SMS${++batch}` }));
+    vi.stubGlobal("fetch", fetch);
+    const outcomes = await white().sendDynamic([
+      { to: "01712345678", message: "Hi Rahim" },
+      { to: "01712345679", message: "Hi all" },
+      { to: "01712345670", message: "Hi all" },
+    ]);
+    expect(sentBodies(fetch).map(({ numbers, body }) => ({ numbers, body }))).toEqual([
+      { numbers: "01712345678", body: "Hi Rahim" },
+      { numbers: "01712345679,01712345670", body: "Hi all" },
+    ]);
+    // One message_id per request: only a single-recipient request carries it.
+    expect(outcomes).toEqual([{ accepted: true, trackingId: "SMS1" }, { accepted: true }, { accepted: true }]);
+  });
+
+  it("reads the provider's code off a 4xx and stops after an account-level refusal", async () => {
+    const fetch = vi.fn(async () => Response.json({ status: "error", code: 2006, message: "Invalid Mobile Number" }, { status: 422 }));
+    vi.stubGlobal("fetch", fetch);
+    expect(await white().send(["01712345678"], "hi")).toEqual([{ accepted: false, reason: "Invalid Mobile Number", failure: "recipient" }]);
+
+    fetch.mockImplementation(async () => Response.json({ status: "error", code: 2000, message: "Invalid API Key" }, { status: 401 }));
+    fetch.mockClear();
+    const messages = Array.from({ length: 10 }, (_, index) => ({ to: "01712345678", message: `code ${index}` }));
+    const outcomes = await white().sendDynamic(messages);
+    expect(fetch.mock.calls.length).toBeLessThan(messages.length);
+    expect(outcomes[0]).toEqual({ accepted: false, reason: "Invalid API Key", failure: "provider" });
+    expect(outcomes.every((outcome) => !outcome.accepted && outcome.failure === "provider")).toBe(true);
+  });
+
+  it("declines recipients past the request budget as retryable without sending them", async () => {
+    const fetch = vi.fn(async () => Response.json({ code: 1000, message_id: "SMS1" }));
+    vi.stubGlobal("fetch", fetch);
+    const messages = Array.from({ length: MAX_PROVIDER_REQUESTS_PER_DISPATCH + 5 }, (_, index) => ({ to: "01712345678", message: `code ${index}` }));
+    const outcomes = await white().sendDynamic(messages);
+    expect(fetch).toHaveBeenCalledTimes(MAX_PROVIDER_REQUESTS_PER_DISPATCH);
+    expect(outcomes.filter((outcome) => outcome.accepted)).toHaveLength(MAX_PROVIDER_REQUESTS_PER_DISPATCH);
+    expect(outcomes.at(-1)).toMatchObject({ accepted: false, failure: "provider" });
   });
 });
 

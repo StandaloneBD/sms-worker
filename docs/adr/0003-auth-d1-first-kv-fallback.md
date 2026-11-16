@@ -61,3 +61,14 @@ resource here, KV write count is.
 - One extra KV read remains on every request (to know whether a refresh is
   needed); KV writes stay bounded to actual changes instead of every
   request.
+
+## Amendment (2026-11-16): refresh before expiry
+
+Entries carry a TTL (`AUTH_CACHE_TTL_SECONDS`), and the KV read moved off
+the request path: each isolate re-reads an entry at most every half TTL.
+Trusting an entry for half a TTL after merely reading it left the shield
+missing for up to that long whenever the read happened near expiry. Each
+write now stores `writtenAt` as KV metadata; the refresh rewrites an entry
+that is missing, differs, or expires within a sixth of the TTL, and trusts
+it only until that point. Cost: about one KV write per key per
+five-sixths of a TTL while the key is in use.
